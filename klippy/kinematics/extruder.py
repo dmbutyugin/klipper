@@ -11,6 +11,7 @@ class ExtruderStepper:
         self.printer = config.get_printer()
         self.name = config.get_name().split()[-1]
         self.pressure_advance = self.pressure_advance_smooth_time = 0.
+        self.input_shaper_step_gen_window = 0.
         self.config_pa = config.getfloat('pressure_advance', 0., minval=0.)
         self.config_smooth_time = config.getfloat(
                 'pressure_advance_smooth_time', 0.040, above=0., maxval=.200)
@@ -46,6 +47,9 @@ class ExtruderStepper:
     def _handle_connect(self):
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.register_step_generator(self.stepper.generate_steps)
+        input_shaper = self.printer.lookup_object('input_shaper', None)
+        if input_shaper:
+            input_shaper.add_extruder(self)
         self._set_pressure_advance(self.config_pa, self.config_smooth_time)
     def get_status(self, eventtime):
         return {'pressure_advance': self.pressure_advance,
@@ -63,7 +67,7 @@ class ExtruderStepper:
         if extruder is None or not isinstance(extruder, PrinterExtruder):
             raise self.printer.command_error("'%s' is not a valid extruder."
                                              % (extruder_name,))
-        self.stepper.set_position([extruder.last_position, 0., 0.])
+        self.stepper.set_position(extruder.last_position)
         self.stepper.set_trapq(extruder.get_trapq())
     def _set_pressure_advance(self, pressure_advance, smooth_time):
         old_smooth_time = self.pressure_advance_smooth_time
@@ -72,14 +76,36 @@ class ExtruderStepper:
         new_smooth_time = smooth_time
         if not pressure_advance:
             new_smooth_time = 0.
+        is_step_gen_window = self.input_shaper_step_gen_window
         toolhead = self.printer.lookup_object("toolhead")
-        toolhead.note_step_generation_scan_time(new_smooth_time * .5,
-                                                old_delay=old_smooth_time * .5)
+        toolhead.note_step_generation_scan_time(
+                new_smooth_time * .5 + is_step_gen_window,
+                old_delay=old_smooth_time * .5 + is_step_gen_window)
         ffi_main, ffi_lib = chelper.get_ffi()
         espa = ffi_lib.extruder_set_pressure_advance
         espa(self.sk_extruder, pressure_advance, new_smooth_time)
         self.pressure_advance = pressure_advance
         self.pressure_advance_smooth_time = smooth_time
+    def update_input_shaping(self, axis_shaper, input_shaper_step_gen_window):
+        smooth_time = self.pressure_advance_smooth_time
+        if not self.pressure_advance:
+            smooth_time = 0.
+        old_input_shaper_step_gen_window = self.input_shaper_step_gen_window
+        toolhead = self.printer.lookup_object("toolhead")
+        toolhead.note_step_generation_scan_time(
+                smooth_time * .5 + input_shaper_step_gen_window,
+                old_delay=smooth_time * .5 + old_input_shaper_step_gen_window)
+        ffi_main, ffi_lib = chelper.get_ffi()
+        axis, n, A, T = axis_shaper.get_shaper()
+        success = ffi_lib.extruder_set_shaper_params(
+                self.sk_extruder, axis.encode(), n, A, T) == 0
+        if not success:
+            axis_shaper.disable_shaping()
+            axis, n, A, T = axis_shaper.get_shaper()
+            ffi_lib.extruder_set_shaper_params(self.sk_extruder,
+                                               axis.encode(), n, A, T)
+        self.input_shaper_step_gen_window = input_shaper_step_gen_window
+        return success
     cmd_SET_PRESSURE_ADVANCE_help = "Set pressure advance parameters"
     def cmd_default_SET_PRESSURE_ADVANCE(self, gcmd):
         extruder = self.printer.lookup_object('toolhead').get_extruder()
@@ -151,7 +177,7 @@ class PrinterExtruder:
     def __init__(self, config, extruder_num):
         self.printer = config.get_printer()
         self.name = config.get_name()
-        self.last_position = 0.
+        self.last_position = [0., 0., 0.]
         # Setup hotend heater
         shared_heater = config.get('shared_heater', None)
         pheaters = self.printer.load_object(config, 'heaters')
@@ -255,19 +281,25 @@ class PrinterExtruder:
         return move.max_cruise_v2
     def move(self, print_time, move):
         axis_r = move.axes_r[3]
-        accel = move.accel * axis_r
-        start_v = move.start_v * axis_r
-        cruise_v = move.cruise_v * axis_r
-        can_pressure_advance = False
-        if axis_r > 0. and (move.axes_d[0] or move.axes_d[1]):
-            can_pressure_advance = True
-        # Queue movement (x is extruder movement, y is pressure advance flag)
+        accel = move.accel * abs(axis_r)
+        start_v = move.start_v * abs(axis_r)
+        cruise_v = move.cruise_v * abs(axis_r)
+        extr_pos = self.last_position
+        if move.is_kinematic_move:
+            # Regular kinematic move with extrusion
+            inv_sum_r = 1. / sum([abs(r) for r in move.axes_r[:3]])
+            extr_r = [math.copysign(abs(r), axis_r) * inv_sum_r
+                      for r in move.axes_r[:3]]
+        else:
+            # Extrude-only move, do not apply pressure advance
+            extr_r = [0., 0., axis_r]
         self.trapq_append(self.trapq, print_time,
                           move.accel_t, move.cruise_t, move.decel_t,
-                          move.start_pos[3], 0., 0.,
-                          1., can_pressure_advance, 0.,
+                          extr_pos[0], extr_pos[1], extr_pos[2],
+                          extr_r[0], extr_r[1], extr_r[2],
                           start_v, cruise_v, accel)
-        self.last_position = move.end_pos[3]
+        for i in range(3):
+            self.last_position[i] += move.axes_d[3] * abs(extr_r[i])
     def find_past_position(self, print_time):
         if self.extruder_stepper is None:
             return 0.
@@ -300,7 +332,7 @@ class PrinterExtruder:
             return
         gcmd.respond_info("Activating extruder %s" % (self.name,))
         toolhead.flush_step_generation()
-        toolhead.set_extruder(self, self.last_position)
+        toolhead.set_extruder(self, sum(self.last_position))
         self.printer.send_event("extruder:activate_extruder")
 
 # Dummy extruder class used when a printer has no extruder at all

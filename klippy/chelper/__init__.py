@@ -26,7 +26,7 @@ SOURCE_FILES = [
 DEST_LIB = "c_helper.so"
 OTHER_FILES = [
     'list.h', 'serialqueue.h', 'stepcompress.h', 'itersolve.h', 'pyhelper.h',
-    'trapq.h', 'pollreactor.h', 'msgblock.h'
+    'trapq.h', 'pollreactor.h', 'msgblock.h', 'kin_shaper.h'
 ]
 
 defs_stepcompress = """
@@ -141,6 +141,8 @@ defs_kin_extruder = """
     struct stepper_kinematics *extruder_stepper_alloc(void);
     void extruder_set_pressure_advance(struct stepper_kinematics *sk
         , double pressure_advance, double smooth_time);
+    int extruder_set_shaper_params(struct stepper_kinematics *sk, char axis
+        , int n, double a[], double t[]);
 """
 
 defs_kin_shaper = """

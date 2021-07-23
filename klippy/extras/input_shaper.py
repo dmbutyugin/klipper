@@ -56,13 +56,13 @@ class AxisInputShaper:
     def get_name(self):
         return 'shaper_' + self.axis
     def get_shaper(self):
-        return self.n, self.A, self.T
+        return self.axis, self.n, self.A, self.T
     def update(self, gcmd):
         self.params.update(gcmd)
         old_n, old_A, old_T = self.n, self.A, self.T
         self.n, self.A, self.T = self.params.get_shaper()
         return (old_n, old_A, old_T) != (self.n, self.A, self.T)
-    def set_shaper_kinematics(self, sk):
+    def update_shaper_kinematics(self, sk):
         ffi_main, ffi_lib = chelper.get_ffi()
         success = ffi_lib.input_shaper_set_shaper_params(
                 sk, self.axis.encode(), self.n, self.A, self.T) == 0
@@ -99,6 +99,7 @@ class InputShaper:
         self.shapers = [AxisInputShaper('x', config),
                         AxisInputShaper('y', config)]
         self.stepper_kinematics = []
+        self.extruders = []
         # Register gcode commands
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command("SET_INPUT_SHAPER",
@@ -121,9 +122,16 @@ class InputShaper:
         # Configure initial values
         self.old_delay = 0.
         self._update_input_shaping(error=self.printer.config_error)
+    def add_extruder(self, extruder):
+        self.extruders.append(extruder)
+        delay = self._get_step_generation_window()
+        for shaper in self.shapers:
+            extruder.update_input_shaping(shaper, delay)
+    def _get_step_generation_window(self):
+        return max([s.get_step_generation_window() for s in self.shapers])
     def _update_input_shaping(self, error=None):
         self.toolhead.flush_step_generation()
-        new_delay = max([s.get_step_generation_window() for s in self.shapers])
+        new_delay = self._get_step_generation_window()
         self.toolhead.note_step_generation_scan_time(new_delay,
                                                      old_delay=self.old_delay)
         failed = []
@@ -131,7 +139,13 @@ class InputShaper:
             for shaper in self.shapers:
                 if shaper in failed:
                     continue
-                if not shaper.set_shaper_kinematics(sk):
+                if not shaper.update_shaper_kinematics(sk):
+                    failed.append(shaper)
+        for e in self.extruders:
+            for shaper in self.shapers:
+                if shaper in failed:
+                    continue
+            if not e.update_input_shaping(shaper, new_delay):
                     failed.append(shaper)
         if failed:
             error = error or self.printer.command_error
