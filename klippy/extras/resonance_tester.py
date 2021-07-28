@@ -87,23 +87,25 @@ class VibrationsTest:
                 "SET_VELOCITY_LIMIT ACCEL=%.3f ACCEL_TO_DECEL=%.3f" % (
                     max_accel, max_accel))
         gcmd.respond_info("Testing frequency %.0f Hz" % (freq,))
+        old_l = 0.
+        max_v = .25 * self.accel_per_hz
         while freq <= self.freq_end + 0.000001:
-            t_seg = .25 / freq
+            half_period = .5 / freq
             accel = self.accel_per_hz * freq
-            max_v = accel * t_seg
+            l = max_v * max_v / accel - old_l
             toolhead.cmd_M204(self.gcode.create_gcode_command(
                 "M204", "M204", {"S": accel}))
-            L = .5 * accel * t_seg**2
-            dX, dY = axis.get_point(L)
+            dX, dY = axis.get_point(l)
             nX = X + sign * dX
             nY = Y + sign * dY
             toolhead.move([nX, nY, Z, E], max_v)
-            toolhead.move([X, Y, Z, E], max_v)
             sign = -sign
             old_freq = freq
-            freq += 2. * t_seg * self.hz_per_sec
+            old_l = l
+            freq += half_period * self.hz_per_sec
             if math.floor(freq) > math.floor(old_freq):
                 gcmd.respond_info("Testing frequency %.0f Hz" % (freq,))
+        toolhead.move([X, Y, Z, E], max_v)
     def finalize_data(self, helper, axis, data):
         data.normalize_to_frequencies()
 
