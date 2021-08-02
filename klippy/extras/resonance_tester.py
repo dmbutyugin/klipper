@@ -4,7 +4,16 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, math, os, time
-from . import shaper_calibrate
+from . import shaper_calibrate, adxl345_simulated
+
+def _parse_probe_points(config):
+    points = config.get('probe_points').split('\n')
+    try:
+        points = [line.split(',', 2) for line in points if line.strip()]
+        return [[float(coord.strip()) for coord in p] for p in points]
+    except:
+        raise config.error("Unable to parse probe_points in %s" % (
+            config.get_name()))
 
 class TestAxis:
     def __init__(self, axis=None, vib_dir=None):
@@ -45,7 +54,7 @@ def _parse_axis(gcmd, raw_axis):
                 "Unable to parse axis direction '%s'" % (raw_axis,))
     return TestAxis(vib_dir=(dir_x, dir_y))
 
-class VibrationPulseTest:
+class VibrationsTest:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.gcode = self.printer.lookup_object('gcode')
@@ -57,8 +66,7 @@ class VibrationPulseTest:
         self.hz_per_sec = config.getfloat('hz_per_sec', 1.,
                                           minval=0.1, maxval=2.)
 
-        self.probe_points = config.getlists('probe_points', seps=(',', '\n'),
-                                            parser=float, count=3)
+        self.probe_points = _parse_probe_points(config)
     def get_start_test_points(self):
         return self.probe_points
     def prepare_test(self, gcmd):
@@ -74,20 +82,10 @@ class VibrationPulseTest:
         freq = self.freq_start
         # Override maximum acceleration and acceleration to
         # deceleration based on the maximum test frequency
-        systime = self.printer.get_reactor().monotonic()
-        toolhead_info = toolhead.get_status(systime)
-        old_max_accel = toolhead_info['max_accel']
-        old_max_accel_to_decel = toolhead_info['max_accel_to_decel']
         max_accel = self.freq_end * self.accel_per_hz
         self.gcode.run_script_from_command(
                 "SET_VELOCITY_LIMIT ACCEL=%.3f ACCEL_TO_DECEL=%.3f" % (
                     max_accel, max_accel))
-        input_shaper = self.printer.lookup_object('input_shaper', None)
-        if input_shaper is not None and not gcmd.get_int('INPUT_SHAPING', 0):
-            input_shaper.disable_shaping()
-            gcmd.respond_info("Disabled [input_shaper] for resonance testing")
-        else:
-            input_shaper = None
         gcmd.respond_info("Testing frequency %.0f Hz" % (freq,))
         while freq <= self.freq_end + 0.000001:
             t_seg = .25 / freq
@@ -106,20 +104,98 @@ class VibrationPulseTest:
             freq += 2. * t_seg * self.hz_per_sec
             if math.floor(freq) > math.floor(old_freq):
                 gcmd.respond_info("Testing frequency %.0f Hz" % (freq,))
-        # Restore the original acceleration values
+    def finalize_data(self, helper, axis, data):
+        data.normalize_to_frequencies()
+
+class MovesTest:
+    def __init__(self, config):
+        self.printer = config.get_printer()
+        self.gcode = self.printer.lookup_object('gcode')
+        self.simulated_accelerometer = adxl345_simulated.ADXL345Simulated(
+                config=None, printer=self.printer)
+        self.probe_points = _parse_probe_points(config)
+        self.order = order = config.getint('order', 1, minval=0, maxval=8)
+        self.runs = config.getint('runs', 5, minval=1)
+        self.max_speed = config.getfloat('max_speed')
+        self.max_accel = config.getfloat('max_accel')
+        self.radius = config.getfloat('radius')
+        self.prepare_moves()
+    def get_start_test_points(self):
+        return self.probe_points
+    def prepare_moves(self):
+        order = self.order
+        self.l = l = self.radius / 3**order
+        state = [0., 1]  # first is position, second is direction
+        moves = []
+        def turn():
+            state[1] = -state[1]
+            moves.append(0)
+        def move(order):
+            if not order:
+                moves.append(state[1] * l)
+                return
+            move(order-1)
+            move(order-1)
+            turn()
+            move(order-1)
+            turn()
+            move(order-1)
+            move(order-1)
+        move(order)
+        turn()
+        move(order)
+        move(order)
+        turn()
+        move(order)
+        self.moves = moves
+    def prepare_test(self, gcmd):
+        self.max_test_speed = gcmd.get_float("MAX_SPEED", self.max_speed)
+        self.max_test_accel = gcmd.get_float("MAX_ACCEL", self.max_accel)
+        self.simulated_results = {}
+    def run_test(self, axis, gcmd):
+        accelerometer = self.simulated_accelerometer
+        accelerometer.start_measurements()
+        toolhead = self.printer.lookup_object('toolhead')
+        X, Y, Z, E = toolhead.get_position()
         self.gcode.run_script_from_command(
-                "SET_VELOCITY_LIMIT ACCEL=%.3f ACCEL_TO_DECEL=%.3f" % (
-                    old_max_accel, old_max_accel_to_decel))
-        # Restore input shaper if it was disabled for resonance testing
-        if input_shaper is not None:
-            input_shaper.enable_shaping()
-            gcmd.respond_info("Re-enabled [input_shaper]")
+                "SET_VELOCITY_LIMIT VELOCITY=%.3f ACCEL=%.3f"
+                " ACCEL_TO_DECEL=%.3f" % (self.max_test_speed,
+                                          self.max_test_accel,
+                                          self.max_test_accel))
+        wait = 2 * self.l / self.max_test_speed
+        old_percent = 0
+        n = len(self.moves)
+        for i in range(self.runs):
+            velocity = self.max_test_speed * .5 * ((i + 1.) / self.runs + 1)
+            for j, move in enumerate(self.moves):
+                dX, dY = axis.get_point(move)
+                nX = X + dX
+                nY = Y + dY
+                if not move:
+                    toolhead.dwell(wait)
+                else:
+                    toolhead.move([nX, nY, Z, E], velocity)
+                X, Y = nX, nY
+                percent = math.floor((j + 1 + i * n) * 100. / (n * self.runs))
+                if percent != old_percent:
+                    gcmd.respond_info("Test progress %d %%" % (percent,))
+                old_percent = percent
+        self.simulated_results[axis] = accelerometer.finish_measurements()
+    def finalize_data(self, helper, axis, data):
+        if axis not in self.simulated_results:
+            return
+        simulated_data = helper.process_accelerometer_data(
+                self.simulated_results[axis])
+        data.subtract(simulated_data)
 
 class ResonanceTester:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.move_speed = config.getfloat('move_speed', 50., above=0.)
-        self.test = VibrationPulseTest(config)
+        test_methods = {'vibrations': VibrationsTest,
+                        'moves': MovesTest}
+        test_method = config.getchoice('method', test_methods, 'vibrations')
+        self.test = test_method(config)
         if not config.get('accel_chip_x', None):
             self.accel_chip_names = [('xy', config.get('accel_chip').strip())]
         else:
@@ -169,8 +245,34 @@ class ResonanceTester:
                     if axis.matches(chip_axis):
                         aclient = chip.start_internal_client()
                         raw_values.append((chip_axis, aclient))
+                # Store the original parameters
+                systime = self.printer.get_reactor().monotonic()
+                toolhead_info = toolhead.get_status(systime)
+                old_max_velocity = toolhead_info['max_velocity']
+                old_max_accel = toolhead_info['max_accel']
+                old_max_accel_to_decel = toolhead_info['max_accel_to_decel']
+                input_shaper = self.printer.lookup_object('input_shaper', None)
+                # Disable input shaping as appropriate
+                if input_shaper is not None and not gcmd.get_int(
+                        'INPUT_SHAPING', 0):
+                    input_shaper.disable_shaping()
+                    gcmd.respond_info(
+                            "Disabled [input_shaper] for resonance testing")
+                else:
+                    input_shaper = None
                 # Generate moves
                 self.test.run_test(axis, gcmd)
+                # Restore the original velocity limits
+                self.gcode.run_script_from_command(
+                        "SET_VELOCITY_LIMIT VELOCITY=%.3f ACCEL=%.3f"
+                        " ACCEL_TO_DECEL=%.3f" % (old_max_velocity,
+                                                  old_max_accel,
+                                                  old_max_accel_to_decel))
+                # Restore input shaper if it was disabled for resonance testing
+                if input_shaper is not None:
+                    input_shaper.enable_shaping()
+                    gcmd.respond_info("Re-enabled [input_shaper]")
+                raw_values = []
                 for chip_axis, aclient in raw_values:
                     aclient.finish_measurements()
                     if raw_name_suffix is not None:
@@ -189,6 +291,7 @@ class ResonanceTester:
                                 "%s-axis accelerometer measured no data" % (
                                     chip_axis,))
                     new_data = helper.process_accelerometer_data(aclient)
+                    self.test.finalize_data(helper, axis, new_data)
                     if calibration_data[axis] is None:
                         calibration_data[axis] = new_data
                     else:
@@ -257,7 +360,6 @@ class ResonanceTester:
             gcmd.respond_info(
                     "Calculating the best input shaper parameters for %s axis"
                     % (axis_name,))
-            calibration_data[axis].normalize_to_frequencies()
             best_shaper, all_shapers = helper.find_best_shaper(
                     calibration_data[axis], max_smoothing, gcmd.respond_info)
             gcmd.respond_info(
