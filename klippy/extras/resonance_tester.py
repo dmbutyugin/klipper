@@ -109,6 +109,74 @@ class VibrationsTest:
     def finalize_data(self, helper, axis, data):
         data.normalize_to_frequencies()
 
+class PulsesTest:
+    def __init__(self, config):
+        self.printer = config.get_printer()
+        self.gcode = self.printer.lookup_object('gcode')
+        self.simulated_accelerometer = adxl345_simulated.ADXL345Simulated(
+                config=None, printer=self.printer)
+        self.multiplicity = config.getint('multiplicity', 10)
+        self.max_freq = config.getfloat('max_freq', 100., maxval=200.)
+        self.min_freq = config.getfloat('min_freq', 10., above=0.)
+        self.hz_per_sec = config.getfloat('hz_per_sec', 1.,
+                                          minval=0.1, maxval=2.)
+        self.max_accel = config.getfloat('max_accel', 10000., above=0.)
+        self.speed = config.getfloat('test_speed', self.max_accel/1000.,
+                                     minval=self.max_accel/1600.)
+        self.probe_points = _parse_probe_points(config)
+    def get_start_test_points(self):
+        return self.probe_points
+    def prepare_test(self, gcmd):
+        self.freq_end = gcmd.get_float("FREQ_END", self.max_freq, maxval=200.)
+        self.freq_start = gcmd.get_float("FREQ_START", self.min_freq, above=0.)
+        self.hz_per_sec = gcmd.get_float("HZ_PER_SEC", self.hz_per_sec,
+                                         above=0., maxval=2.)
+        self.test_speed = gcmd.get_float("TEST_SPEED", self.speed, above=0.)
+        self.max_test_accel = gcmd.get_float("MAX_ACCEL", self.max_accel,
+                                             above=0.)
+        self.simulated_results = {}
+    def run_test(self, axis, gcmd):
+        accelerometer = self.simulated_accelerometer
+        accelerometer.start_measurements()
+        toolhead = self.printer.lookup_object('toolhead')
+        X, Y, Z, E = toolhead.get_position()
+        sign = 1.
+        freq = self.freq_start
+        accel = self.max_test_accel
+        max_v = self.test_speed
+        accel_t = max_v / accel
+        self.gcode.run_script_from_command(
+                "SET_VELOCITY_LIMIT ACCEL=%.3f ACCEL_TO_DECEL=%.3f" % (
+                    accel, accel))
+        old_percent = 0
+        old_l = 0.
+        while freq <= self.freq_end + 0.000001:
+            half_period = .5 / freq * self.multiplicity
+            if half_period < 2. * accel_t:
+                break
+            l = accel * accel_t**2 + max_v * (half_period - 2.*accel_t) - old_l
+            dX, dY = axis.get_point(l)
+            nX = X + sign * dX
+            nY = Y + sign * dY
+            toolhead.move([nX, nY, Z, E], max_v)
+            sign = -sign
+            old_freq = freq
+            old_l = l
+            freq += half_period * self.hz_per_sec
+            percent = math.floor((freq - self.freq_start) * 100. /
+                                 (self.freq_end - self.freq_start))
+            if percent != old_percent:
+                gcmd.respond_info("Test progress %d %%" % (percent,))
+            old_percent = percent
+        toolhead.move([X, Y, Z, E], max_v)
+        self.simulated_results[axis] = accelerometer.finish_measurements()
+    def finalize_data(self, helper, axis, data):
+        if axis not in self.simulated_results:
+            return
+        simulated_data = helper.process_accelerometer_data(
+                self.simulated_results[axis])
+        data.subtract(simulated_data)
+
 class MovesTest:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -195,6 +263,7 @@ class ResonanceTester:
         self.printer = config.get_printer()
         self.move_speed = config.getfloat('move_speed', 50., above=0.)
         test_methods = {'vibrations': VibrationsTest,
+                        'pulses': PulsesTest,
                         'moves': MovesTest}
         test_method = config.getchoice('method', test_methods, 'vibrations')
         self.test = test_method(config)
