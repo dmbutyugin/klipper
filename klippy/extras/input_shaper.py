@@ -142,6 +142,15 @@ class InputShaper:
                              id_to_name[shaper_type_y],
                              shaper_freq_x, shaper_freq_y,
                              damping_ratio_x, damping_ratio_y))
+    def get_status(self, eventtime):
+        id_to_name = {v: n for n, v in self.shapers.items()}
+        res = {'shaper_x': {'type': id_to_name[self.shaper_type_x],
+                            'frequency': self.shaper_freq_x,
+                            'damping_ratio': self.damping_ratio_x},
+               'shaper_y': {'type': id_to_name[self.shaper_type_y],
+                            'frequency': self.shaper_freq_y,
+                            'damping_ratio': self.damping_ratio_y}}
+        return res
 
 def load_config(config):
     return InputShaper(config)

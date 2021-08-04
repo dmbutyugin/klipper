@@ -4,7 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, time, multiprocessing, os
-from . import adxl345
+from . import adxl345, shaper_calibrate
 from adxl345 import Accel_Measurement
 
 # Results of the simulated measurements
@@ -13,34 +13,55 @@ class ADXL345SimulatedResults:
         self.accel_bounds = []
         self.samples = []
         self.time_per_sample = self.start_range = self.end_range = 0.
-    def setup_data(self, query_rate, accel_bounds, reactor):
+    def setup_data(self, query_rate, accel_bounds, start_time, end_time,
+                   shaper_x, shaper_y, reactor):
         self.reactor = reactor
+        self.shaper_x = shaper_x if shaper_x else self._unity_shaper()
+        self.shaper_y = shaper_y if shaper_y else self._unity_shaper()
         self.accel_bounds = accel_bounds
-        self.start_range = time = self.accel_bounds[0].time
-        self.end_range = end_range = self.accel_bounds[-1].time
+        self.start_range = start_time
+        self.end_range = end_time
         self.time_per_sample = 1. / query_rate
     def get_stats(self):
         return ("time_per_sample=%.9f,start_range=%.6f,end_range=%.6f"
                 % (self.time_per_sample, self.start_range, self.end_range))
+    def _unity_shaper(self):
+        return [1.], [0.]
     def _gen_samples(self):
         accel_bounds = self.accel_bounds
         if not accel_bounds:
             return
-        time, end_range = accel_bounds[0].time, accel_bounds[-1].time
+        time = self.start_range
         time_per_sample = self.time_per_sample
-        i = 0
-        while time < end_range:
-            while time >= accel_bounds[i+1].time:
-                i += 1
-            _, accel_x, accel_y, accel_z = accel_bounds[i]
-            yield Accel_Measurement(time, accel_x, accel_y, accel_z)
+        Ax, Tx = self.shaper_x
+        Ay, Ty = self.shaper_y
+        Az, Tz = self._unity_shaper()
+        n = [len(Ax), len(Ay), 1]
+        A = [Ax, Ay, Az]
+        T = [Tx, Ty, Tz]
+        idx = [[0] * n[0], [0] * n[1], [0] * n[2]]
+        while time < self.end_range:
+            accel = [None] * 3
+            for j in range(3):
+                a = A[j]
+                t = T[j]
+                ind = idx[j]
+                res = 0.
+                for k in range(n[j]):
+                    ts = time - t[k]
+                    i = ind[k]
+                    while ts >= accel_bounds[i+1].time:
+                        i += 1
+                    # 0-th Accel_Measurement element is time
+                    res += a[k] * accel_bounds[i][j + 1]
+                    ind[k] = i
+                accel[j] = res
+            yield Accel_Measurement(time, accel[0], accel[1], accel[2])
             time += time_per_sample
     def decode_samples(self):
         samples = self.samples
         if not self.accel_bounds:
             return samples
-        self.start_range = self.accel_bounds[0].time
-        self.end_range = self.accel_bounds[-1].time
         for sample in self._gen_samples():
             samples.append(sample)
         return samples
@@ -108,25 +129,45 @@ class ADXL345Simulated:
         self.accel_bounds.append(Accel_Measurement(move_time, 0., 0., 0.))
     def start_measurements(self, rate=None):
         rate = rate or self.data_rate
-        self.accel_bounds = []
+        self.query_rate = rate
         # Setup samples
         toolhead = self.printer.lookup_object('toolhead')
-        print_time = toolhead.get_last_move_time()
+        self.samples_start = print_time = toolhead.get_last_move_time()
+        self.accel_bounds = [Accel_Measurement(print_time, 0., 0., 0.)]
         # Start move tracking
         toolhead.register_move_monitoring_callback(self._handle_move)
-        self.query_rate = rate
+        # Capture input shaping parameters
+        self.shaper_x = self.shaper_y = None
+        input_shaper = self.printer.lookup_object('input_shaper', None)
+        if input_shaper is not None:
+            shaper_status = input_shaper.get_status(self.samples_start)
+            if shaper_status['shaper_x']['frequency']:
+                self.shaper_x = shaper_calibrate.get_input_shaper(
+                        shaper_status['shaper_x']['type'],
+                        shaper_status['shaper_x']['frequency'],
+                        shaper_status['shaper_x']['damping_ratio'])
+            if shaper_status['shaper_y']['frequency']:
+                self.shaper_y = shaper_calibrate.get_input_shaper(
+                        shaper_status['shaper_y']['type'],
+                        shaper_status['shaper_y']['frequency'],
+                        shaper_status['shaper_y']['damping_ratio'])
+
     def finish_measurements(self):
         query_rate = self.query_rate
         if not query_rate:
             return ADXL345SimulatedResults()
         # Halt move tracking
         toolhead = self.printer.lookup_object('toolhead')
-        print_time = toolhead.get_last_move_time()
+        samples_end = print_time = toolhead.get_last_move_time()
         toolhead.unregister_move_monitoring_callback(self._handle_move)
+        self.accel_bounds.append(Accel_Measurement(print_time, 0., 0., 0.))
         accel_bounds = self.accel_bounds
         self.accel_bounds = []
         res = ADXL345SimulatedResults()
-        res.setup_data(query_rate, accel_bounds, self.printer.reactor)
+        res.setup_data(query_rate, accel_bounds,
+                       self.samples_start, samples_end,
+                       self.shaper_x, self.shaper_y,
+                       self.printer.reactor)
         logging.info("Simulated ADXL345 finished measurements: %s",
                      res.get_stats())
         return res

@@ -127,6 +127,20 @@ INPUT_SHAPERS = [
     InputShaperCfg('3hump_ei', get_3hump_ei_shaper, min_freq=48.),
 ]
 
+def get_input_shaper(shaper_type, shaper_freq, damping_ratio):
+    for shaper_cfg in INPUT_SHAPERS:
+        if shaper_cfg.name == shaper_type:
+            A, T = shaper_cfg.init_func(shaper_freq, damping_ratio)
+            inv_D = 1. / sum(A)
+            n = len(T)
+            # Calculate the input shaper shift
+            ts = sum([A[i] * T[i] for i in range(n)]) * inv_D
+            for i in range(n):
+                A[i] *= inv_D
+                T[i] -= ts
+            return A, T
+    return None
+
 ######################################################################
 # Frequency response calculation and shaper auto-tuning
 ######################################################################
