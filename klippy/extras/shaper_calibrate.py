@@ -274,8 +274,12 @@ class ShaperCalibrate:
         # and the 'DC' term (0 Hz)
         result[1:-1,:] *= 2.
 
+        # Remove constant background noise, e.g. loud unbalanced fans
+        background_noise = np.quantile(result.real, 0.1, axis=-1)
+        filtered_results = result.real - background_noise[:, np.newaxis]
+
         # Welch's algorithm: average response over windows
-        psd = result.real.mean(axis=-1)
+        psd = filtered_results.mean(axis=-1)
 
         # Calculate the frequency bins
         freqs = np.fft.rfftfreq(nfft, 1. / fs)
