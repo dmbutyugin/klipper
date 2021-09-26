@@ -4,35 +4,77 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, time, multiprocessing, os
-from . import adxl345, shaper_calibrate
-from adxl345 import Accel_Measurement
+import chelper
+from . import adxl345, motion_report, shaper_calibrate
+from adxl345 import Accel_Measurement, ADXLCommandHelper
+
+NEVER_TIME = 9999999999999999.
+UPDATE_INTERVAL = 0.1
 
 # Results of the simulated measurements
-class ADXL345SimulatedResults:
-    def __init__(self):
-        self.accel_bounds = []
+class ADXL345SimulatedQueryHelper:
+    def __init__(self, printer, cconn, data_rate):
+        self.printer = printer
+        self.cconn = cconn
+        print_time = printer.lookup_object('toolhead').get_last_move_time()
+        self.request_start_time = self.request_end_time = print_time
         self.samples = []
-        self.time_per_sample = self.start_range = self.end_range = 0.
-    def setup_data(self, query_rate, accel_bounds, start_time, end_time,
-                   shaper_x, shaper_y, reactor):
-        self.reactor = reactor
-        self.shaper_x = shaper_x if shaper_x else self._unity_shaper()
-        self.shaper_y = shaper_y if shaper_y else self._unity_shaper()
-        self.accel_bounds = accel_bounds
-        self.start_range = start_time
-        self.end_range = end_time
-        self.time_per_sample = 1. / query_rate
-    def get_stats(self):
-        return ("time_per_sample=%.9f,start_range=%.6f,end_range=%.6f"
-                % (self.time_per_sample, self.start_range, self.end_range))
+        self.data_rate = data_rate
+        # Capture input shaping parameters
+        self.shaper_x = self.shaper_y = self._unity_shaper()
+        input_shaper = self.printer.lookup_object('input_shaper', None)
+        if input_shaper is not None:
+            shaper_status = input_shaper.get_status(print_time)
+            if shaper_status['shaper_x']['frequency']:
+                self.shaper_x = shaper_calibrate.get_input_shaper(
+                        shaper_status['shaper_x']['type'],
+                        shaper_status['shaper_x']['frequency'],
+                        shaper_status['shaper_x']['damping_ratio'])
+            if shaper_status['shaper_y']['frequency']:
+                self.shaper_y = shaper_calibrate.get_input_shaper(
+                        shaper_status['shaper_y']['type'],
+                        shaper_status['shaper_y']['frequency'],
+                        shaper_status['shaper_y']['damping_ratio'])
+    def finish_measurements(self):
+        reactor = self.printer.get_reactor()
+        toolhead = self.printer.lookup_object('toolhead')
+        self.request_end_time = toolhead.get_last_move_time()
+        toolhead.wait_moves()
+        reactor.pause(reactor.monotonic() + UPDATE_INTERVAL)
+        self.cconn.finalize()
+        reactor.pause(reactor.monotonic() + UPDATE_INTERVAL)
     def _unity_shaper(self):
         return [1.], [0.]
-    def _gen_samples(self):
-        accel_bounds = self.accel_bounds
-        if not accel_bounds:
-            return
-        time = self.start_range
-        time_per_sample = self.time_per_sample
+    def _gen_timestamps(self):
+        time = self.request_start_time
+        time_per_sample = 1. / self.data_rate
+        while time <= self.request_end_time:
+            yield time
+            time += time_per_sample
+    def _gen_accel_bounds(self):
+        next_time = NEVER_TIME
+        accel_bounds = [Accel_Measurement(0., 0., 0., 0.)]
+        for msg in self.raw_moves:
+            for move in msg['params']['data']:
+                move_time = move[0]
+                if accel_bounds and accel_bounds[-1].time > move_time:
+                    raise self.printer.command_error(
+                            "Internal error: moves captured backwards")
+                if next_time < move_time:
+                    accel_bounds.append(
+                            Accel_Measurement(next_time, 0., 0., 0.))
+                ax = move[2] * move[3][0]
+                ay = move[2] * move[3][1]
+                az = move[2] * move[3][2]
+                accel_bounds.append(Accel_Measurement(move_time, ax, ay, az))
+                next_time = move_time + move[1]
+        accel_bounds.append(Accel_Measurement(next_time, 0., 0., 0.))
+        accel_bounds.append(Accel_Measurement(NEVER_TIME, 0., 0., 0.))
+        return accel_bounds
+    def _gen_samples(self, timestamps=None):
+        if timestamps is None:
+            timestamps = self._gen_timestamps()
+        accel_bounds = self._gen_accel_bounds()
         Ax, Tx = self.shaper_x
         Ay, Ty = self.shaper_y
         Az, Tz = self._unity_shaper()
@@ -40,7 +82,11 @@ class ADXL345SimulatedResults:
         A = [Ax, Ay, Az]
         T = [Tx, Ty, Tz]
         idx = [[0] * n[0], [0] * n[1], [0] * n[2]]
-        while time < self.end_range:
+        prev_time = None
+        for time in timestamps:
+            if prev_time and prev_time > time:
+                raise self.printer.command_error(
+                        "Internal error: timestamps must be increasing")
             accel = [None] * 3
             for j in range(3):
                 a = A[j]
@@ -57,141 +103,92 @@ class ADXL345SimulatedResults:
                     ind[k] = i
                 accel[j] = res
             yield Accel_Measurement(time, accel[0], accel[1], accel[2])
-            time += time_per_sample
-    def decode_samples(self):
-        samples = self.samples
-        if not self.accel_bounds:
-            return samples
+            prev_time = time
+    def get_samples(self):
+        raw_moves = self.cconn.get_messages()
+        if not raw_moves:
+            return self.samples
+        self.raw_moves = raw_moves
+        samples = []
         for sample in self._gen_samples():
+            samples.append(sample)
+        self.samples = samples
+        return samples
+    def generate_samples(self, timestamps):
+        raw_moves = self.cconn.get_messages()
+        if raw_moves:
+            self.raw_moves = raw_moves
+        samples = []
+        for sample in self._gen_samples(timestamps):
             samples.append(sample)
         return samples
     def write_to_file(self, filename):
-        def write_impl():
-            try:
-                # Try to re-nice writing process
-                os.nice(20)
-            except:
-                pass
-            f = open(filename, "w")
-            f.write("##%s\n#time,accel_x,accel_y,accel_z\n" % (
-                self.get_stats(),))
-            for s in self._gen_samples():
-                f.write("%.6f,%.6f,%.6f,%.6f\n" % (
-                    s.time, s.accel_x, s.accel_y, s.accel_z))
-            f.close()
-        write_proc = multiprocessing.Process(target=write_impl)
-        write_proc.daemon = True
-        write_proc.start()
-        eventtime = last_report_time = self.reactor.monotonic()
-        while write_proc.is_alive():
-            if eventtime > last_report_time + 5.:
-                last_report_time = eventtime
-                gcode.respond_info("Wait for writing..", log=False)
-            eventtime = self.reactor.pause(eventtime + .1)
+        f = open(filename, "w")
+        f.write("#time,accel_x,accel_y,accel_z\n")
+        samples = self.samples or self.get_samples()
+        for t, accel_x, accel_y, accel_z in samples:
+            f.write("%.6f,%.6f,%.6f,%.6f\n" % (
+                t, accel_x, accel_y, accel_z))
+        f.close()
 
 # Printer class that controls measurments
 class ADXL345Simulated:
     def __init__(self, config, printer=None):
         self.printer = config.get_printer() if printer is None else printer
-        self.query_rate = 0
-        self.accel_bounds = []
         self.name = "simulated"
         if config:
+            ADXLCommandHelper(config, self)
             self.data_rate = config.getint('rate', 3200, minval=1)
             if len(config.get_name().split()) > 1:
-                self.name = config.get_name().split()[1]
-            # Register commands
-            gcode = self.printer.lookup_object('gcode')
-            gcode.register_mux_command("ACCELEROMETER_MEASURE", "CHIP",
-                                       self.name,
-                                       self.cmd_ACCELEROMETER_MEASURE,
-                                       desc=self.cmd_ACCELEROMETER_MEASURE_help)
+                self.name = config.get_name().split()[-1]
         else:
             self.data_rate = 3200
-    def _handle_move(self, move_time, move):
-        if not move.is_kinematic_move:
-            return
-        if move.accel_t > 0.:
-            x = move.accel * move.axes_r[0]
-            y = move.accel * move.axes_r[1]
-            z = move.accel * move.axes_r[2]
-            self.accel_bounds.append(Accel_Measurement(move_time, x, y, z))
-        move_time += move.accel_t
-        if move.cruise_t > 0.:
-            self.accel_bounds.append(Accel_Measurement(move_time, 0., 0., 0.))
-        move_time += move.cruise_t
-        if move.decel_t > 0.:
-            x = -move.accel * move.axes_r[0]
-            y = -move.accel * move.axes_r[1]
-            z = -move.accel * move.axes_r[2]
-            self.accel_bounds.append(Accel_Measurement(move_time, x, y, z))
-        move_time += move.decel_t
-        self.accel_bounds.append(Accel_Measurement(move_time, 0., 0., 0.))
-    def start_measurements(self, rate=None):
-        rate = rate or self.data_rate
-        self.query_rate = rate
-        # Setup samples
+        # API server endpoints
+        self.api_dump = motion_report.APIDumpHelper(
+                self.printer, self._api_update,
+                self._api_startstop, UPDATE_INTERVAL)
+        self.last_api_msg = (0., 0.)
+    def _start_measurements(self):
         toolhead = self.printer.lookup_object('toolhead')
-        self.samples_start = print_time = toolhead.get_last_move_time()
-        self.accel_bounds = [Accel_Measurement(print_time, 0., 0., 0.)]
-        # Start move tracking
-        toolhead.register_move_monitoring_callback(self._handle_move)
-        # Capture input shaping parameters
-        self.shaper_x = self.shaper_y = None
-        input_shaper = self.printer.lookup_object('input_shaper', None)
-        if input_shaper is not None:
-            shaper_status = input_shaper.get_status(self.samples_start)
-            if shaper_status['shaper_x']['frequency']:
-                self.shaper_x = shaper_calibrate.get_input_shaper(
-                        shaper_status['shaper_x']['type'],
-                        shaper_status['shaper_x']['frequency'],
-                        shaper_status['shaper_x']['damping_ratio'])
-            if shaper_status['shaper_y']['frequency']:
-                self.shaper_y = shaper_calibrate.get_input_shaper(
-                        shaper_status['shaper_y']['type'],
-                        shaper_status['shaper_y']['frequency'],
-                        shaper_status['shaper_y']['damping_ratio'])
-
-    def finish_measurements(self):
-        query_rate = self.query_rate
-        if not query_rate:
-            return ADXL345SimulatedResults()
-        # Halt move tracking
-        toolhead = self.printer.lookup_object('toolhead')
-        samples_end = print_time = toolhead.get_last_move_time()
-        toolhead.unregister_move_monitoring_callback(self._handle_move)
-        self.accel_bounds.append(Accel_Measurement(print_time, 0., 0., 0.))
-        accel_bounds = self.accel_bounds
-        self.accel_bounds = []
-        res = ADXL345SimulatedResults()
-        res.setup_data(query_rate, accel_bounds,
-                       self.samples_start, samples_end,
-                       self.shaper_x, self.shaper_y,
-                       self.printer.reactor)
-        logging.info("Simulated ADXL345 finished measurements: %s",
-                     res.get_stats())
-        return res
-    def end_query(self, name):
-        if not self.query_rate:
-            return
-        res = self.finish_measurements()
-        # Write data to file
-        filename = "/tmp/adxl345-%s.csv" % (name,)
-        res.write_to_file(filename)
-    cmd_ACCELEROMETER_MEASURE_help = "Start/stop simulated accelerometer"
-    def cmd_ACCELEROMETER_MEASURE(self, gcmd):
-        if self.query_rate:
-            name = gcmd.get("NAME", time.strftime("%Y%m%d_%H%M%S"))
-            if not name.replace('-', '').replace('_', '').isalnum():
-                raise gcmd.error("Invalid adxl345 NAME parameter")
-            self.end_query(name)
-            gcmd.respond_info("adxl345 measurements stopped")
+        self.trapq = toolhead.get_trapq()
+        logging.info("Simulated ADXL345 started measurements")
+    def _finish_measurements(self):
+        logging.info("Simulated ADXL345 finished measurements")
+    def extract_trapq(self, start_time, end_time):
+        ffi_main, ffi_lib = chelper.get_ffi()
+        res = []
+        while 1:
+            data = ffi_main.new('struct pull_move[128]')
+            count = ffi_lib.trapq_extract_old(self.trapq, data, len(data),
+                                              start_time, end_time)
+            if not count:
+                break
+            res.append((data, count))
+            if count < len(data):
+                break
+            end_time = data[count-1].print_time
+        res.reverse()
+        return ([d[i] for d, cnt in res for i in range(cnt-1, -1, -1)], res)
+    # API interface
+    def _api_update(self, eventtime):
+        qtime = self.last_api_msg[0] + min(self.last_api_msg[1], 0.100)
+        data, cdata = self.extract_trapq(qtime, NEVER_TIME)
+        d = [(m.print_time, m.move_t, m.accel, (m.x_r, m.y_r, m.z_r))
+             for m in data]
+        if d and d[0] == self.last_api_msg:
+            d.pop(0)
+        if not d:
+            return {}
+        self.last_api_msg = d[-1]
+        return {"data": d}
+    def _api_startstop(self, is_start):
+        if is_start:
+            self._start_measurements()
         else:
-            rate = gcmd.get_int("RATE", self.data_rate)
-            if rate not in QUERY_RATES:
-                raise gcmd.error("Not a valid adxl345 query rate: %d" % (rate,))
-            self.start_measurements(rate)
-            gcmd.respond_info("adxl345 measurements started")
+            self._finish_measurements()
+    def start_internal_client(self):
+        cconn = self.api_dump.add_internal_client()
+        return ADXL345SimulatedQueryHelper(self.printer, cconn, self.data_rate)
 
 def load_config(config):
     return ADXL345Simulated(config)
