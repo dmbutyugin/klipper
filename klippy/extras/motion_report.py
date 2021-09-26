@@ -61,17 +61,16 @@ class APIDumpHelper:
         except self.printer.command_error as e:
             logging.exception("API Dump Helper data callback error")
             return self._stop()
-        if not msg:
-            return eventtime + self.update_interval
         for cconn, template in list(self.clients.items()):
             if cconn.is_closed():
                 del self.clients[cconn]
                 if not self.clients:
                     return self._stop()
                 continue
-            tmp = dict(template)
-            tmp['params'] = msg
-            cconn.send(tmp)
+            if msg:
+                tmp = dict(template)
+                tmp['params'] = msg
+                cconn.send(tmp)
         return eventtime + self.update_interval
 
 # An "internal webhooks" wrapper for using APIDumpHelper internally
