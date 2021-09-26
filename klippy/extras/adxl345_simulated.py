@@ -7,6 +7,7 @@ import logging, time, multiprocessing, os
 import chelper
 from . import adxl345, motion_report, shaper_calibrate
 from adxl345 import Accel_Measurement, ADXLCommandHelper
+from adxl345 import write_accelerometer_data
 
 NEVER_TIME = 9999999999999999.
 UPDATE_INTERVAL = 0.1
@@ -132,13 +133,29 @@ class ADXL345SimulatedQueryHelper:
             samples.append(sample)
         return samples
     def write_to_file(self, filename):
-        f = open(filename, "w")
-        f.write("#time,accel_x,accel_y,accel_z\n")
-        samples = self.samples or self.get_samples()
-        for t, accel_x, accel_y, accel_z in samples:
-            f.write("%.6f,%.6f,%.6f,%.6f\n" % (
-                t, accel_x, accel_y, accel_z))
-        f.close()
+        write_accelerometer_data(self.get_samples(), filename)
+
+class AccelerometerDataDiff:
+    def __init__(self, raw_data, simulated_data):
+        self.raw_data = raw_data
+        self.simulated_data = simulated_data
+        self.samples = None
+    def get_samples(self):
+        if self.samples is not None:
+            return self.samples
+        raw_samples = self.raw_data.get_samples()
+        timestamps = [rs.time for rs in raw_samples]
+        expected_samples = self.simulated_data.generate_samples(timestamps)
+        adjusted_samples = []
+        for rs, es in zip(raw_samples, expected_samples):
+            adjusted_samples.append(Accel_Measurement(rs.time,
+                                                      rs.accel_x - es.accel_x,
+                                                      rs.accel_y - es.accel_y,
+                                                      rs.accel_z - es.accel_z))
+        self.samples = adjusted_samples
+        return self.samples
+    def write_to_file(self, filename):
+        write_accelerometer_data(self.get_samples(), filename)
 
 # Printer class that controls measurments
 class ADXL345Simulated:
