@@ -246,7 +246,6 @@ class ToolHead:
         self.trapq_append = ffi_lib.trapq_append
         self.trapq_finalize_moves = ffi_lib.trapq_finalize_moves
         self.step_generators = []
-        self.move_monitoring_callbacks = []
         # Create kinematics class
         gcode = self.printer.lookup_object('gcode')
         self.Coord = gcode.Coord
@@ -328,8 +327,6 @@ class ToolHead:
                               + move.cruise_t + move.decel_t)
             for cb in move.timing_callbacks:
                 cb(next_move_time)
-            for cb in self.move_monitoring_callbacks:
-                cb(next_move_time, move)
         # Generate steps for moves
         if self.special_queuing_state:
             self._update_drip_move_time(next_move_time)
@@ -539,10 +536,6 @@ class ToolHead:
         last_move.timing_callbacks.append(callback)
     def note_kinematic_activity(self, kin_time):
         self.last_kin_move_time = max(self.last_kin_move_time, kin_time)
-    def register_move_monitoring_callback(self, callback):
-        self.move_monitoring_callbacks.append(callback)
-    def unregister_move_monitoring_callback(self, callback):
-        self.move_monitoring_callbacks.remove(callback)
     def get_max_velocity(self):
         return self.max_velocity, self.max_accel
     def _calc_junction_deviation(self):

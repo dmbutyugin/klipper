@@ -76,6 +76,7 @@ class VibrationsTest:
         self.hz_per_sec = gcmd.get_float("HZ_PER_SEC", self.hz_per_sec,
                                          above=0., maxval=2.)
     def run_test(self, axis, gcmd):
+        reactor = self.printer.get_reactor()
         toolhead = self.printer.lookup_object('toolhead')
         X, Y, Z, E = toolhead.get_position()
         sign = 1.
@@ -104,6 +105,7 @@ class VibrationsTest:
             freq += 2. * t_seg * self.hz_per_sec
             if math.floor(freq) > math.floor(old_freq):
                 gcmd.respond_info("Testing frequency %.0f Hz" % (freq,))
+                reactor.pause(reactor.monotonic() + 0.01)
     def finalize_data(self, helper, axis, data):
         data.normalize_to_frequencies()
 
@@ -135,7 +137,8 @@ class PulsesTest:
         self.simulated_results = {}
     def run_test(self, axis, gcmd):
         accelerometer = self.simulated_accelerometer
-        accelerometer.start_measurements()
+        aclient = accelerometer.start_internal_client()
+        reactor = self.printer.get_reactor()
         toolhead = self.printer.lookup_object('toolhead')
         X, Y, Z, E = toolhead.get_position()
         sign = 1.
@@ -163,8 +166,10 @@ class PulsesTest:
                                  (self.freq_end - self.freq_start))
             if percent != old_percent:
                 gcmd.respond_info("Test progress %d %%" % (percent,))
+                reactor.pause(reactor.monotonic() + 0.01)
             old_percent = percent
-        self.simulated_results[axis] = accelerometer.finish_measurements()
+        aclient.finish_measurements()
+        self.simulated_results[axis] = aclient
     def finalize_data(self, helper, axis, data):
         if axis not in self.simulated_results:
             return
@@ -219,7 +224,7 @@ class MovesTest:
         self.simulated_results = {}
     def run_test(self, axis, gcmd):
         accelerometer = self.simulated_accelerometer
-        accelerometer.start_measurements()
+        aclient = accelerometer.start_internal_client()
         toolhead = self.printer.lookup_object('toolhead')
         X, Y, Z, E = toolhead.get_position()
         self.gcode.run_script_from_command(
@@ -245,7 +250,8 @@ class MovesTest:
                 if percent != old_percent:
                     gcmd.respond_info("Test progress %d %%" % (percent,))
                 old_percent = percent
-        self.simulated_results[axis] = accelerometer.finish_measurements()
+        aclient.finish_measurements()
+        self.simulated_results[axis] = aclient
     def finalize_data(self, helper, axis, data):
         if axis not in self.simulated_results:
             return
@@ -306,6 +312,12 @@ class ResonanceTester:
                 if len(axes) > 1:
                     gcmd.respond_info("Testing axis %s" % axis.get_name())
 
+                # Start acceleration measurements
+                raw_values = []
+                for chip_axis, chip in self.accel_chips:
+                    if axis.matches(chip_axis):
+                        aclient = chip.start_internal_client()
+                        raw_values.append((chip_axis, aclient))
                 # Store the original parameters
                 systime = self.printer.get_reactor().monotonic()
                 toolhead_info = toolhead.get_status(systime)
@@ -321,12 +333,6 @@ class ResonanceTester:
                             "Disabled [input_shaper] for resonance testing")
                 else:
                     input_shaper = None
-                # Start acceleration measurements
-                raw_values = []
-                for chip_axis, chip in self.accel_chips:
-                    if axis.matches(chip_axis):
-                        aclient = chip.start_internal_client()
-                        raw_values.append((chip_axis, aclient))
                 # Generate moves
                 self.test.run_test(axis, gcmd)
                 # Restore the original velocity limits
@@ -340,7 +346,6 @@ class ResonanceTester:
                     input_shaper.enable_shaping()
                     gcmd.respond_info("Re-enabled [input_shaper]")
                 # Obtain the measurement results
-                raw_values = []
                 for chip_axis, aclient in raw_values:
                     aclient.finish_measurements()
                     if raw_name_suffix is not None:
