@@ -108,8 +108,10 @@ class VibrationsTest:
                 gcmd.respond_info("Testing frequency %.0f Hz" % (freq,))
                 reactor.pause(reactor.monotonic() + 0.01)
         toolhead.move([X, Y, Z, E], max_v)
-    def finalize_data(self, helper, axis, data):
+    def process_raw_data(self, helper, axis, raw_data):
+        data = helper.process_accelerometer_data(raw_data)
         data.normalize_to_frequencies()
+        return data, raw_data
 
 class PulsesTest:
     def __init__(self, config):
@@ -175,12 +177,13 @@ class PulsesTest:
         toolhead.move([X, Y, Z, E], max_v)
         aclient.finish_measurements()
         self.simulated_results[axis] = aclient
-    def finalize_data(self, helper, axis, data):
+    def process_raw_data(self, helper, axis, raw_data):
         if axis not in self.simulated_results:
-            return
-        simulated_data = helper.process_accelerometer_data(
-                self.simulated_results[axis])
-        data.subtract(simulated_data)
+            return helper.process_accelerometer_data(raw_data)
+        adjusted_samples = adxl345_simulated.AccelerometerDataDiff(
+                raw_data, self.simulated_results[axis])
+        data = helper.process_accelerometer_data(adjusted_samples)
+        return data, adjusted_samples
 
 class MovesTest:
     def __init__(self, config):
@@ -257,12 +260,13 @@ class MovesTest:
                 old_percent = percent
         aclient.finish_measurements()
         self.simulated_results[axis] = aclient
-    def finalize_data(self, helper, axis, data):
+    def process_raw_data(self, helper, axis, raw_data):
         if axis not in self.simulated_results:
-            return
-        simulated_data = helper.process_accelerometer_data(
-                self.simulated_results[axis])
-        data.subtract(simulated_data)
+            return helper.process_accelerometer_data(raw_data)
+        adjusted_samples = adxl345_simulated.AccelerometerDataDiff(
+                raw_data, self.simulated_results[axis])
+        data = helper.process_accelerometer_data(adjusted_samples)
+        return data, adjusted_samples
 
 class ResonanceTester:
     def __init__(self, config):
@@ -368,8 +372,16 @@ class ResonanceTester:
                         raise gcmd.error(
                                 "%s-axis accelerometer measured no data" % (
                                     chip_axis,))
-                    new_data = helper.process_accelerometer_data(aclient)
-                    self.test.finalize_data(helper, axis, new_data)
+                    new_data, raw_data = self.test.process_raw_data(
+                            helper, axis, aclient)
+                    if raw_data != aclient and raw_name_suffix is not None:
+                        raw_name = self.get_filename(
+                                'raw_data_adjusted', raw_name_suffix, axis,
+                                point if len(test_points) > 1 else None)
+                        raw_data.write_to_file(raw_name)
+                        gcmd.respond_info(
+                                "Writing adjusted raw accelerometer data to "
+                                "%s file" % (raw_name,))
                     if calibration_data[axis] is None:
                         calibration_data[axis] = new_data
                     else:

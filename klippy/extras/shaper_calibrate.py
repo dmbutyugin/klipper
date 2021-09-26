@@ -167,16 +167,6 @@ class CalibrationData:
             psd *= self.data_sets
             psd[:] = (psd + other_normalized) * (1. / joined_data_sets)
         self.data_sets = joined_data_sets
-    def subtract(self, other):
-        np = self.numpy
-        for psd, other_psd in zip(self._psd_list, other._psd_list):
-            # `other` data may be defined at different frequency bins,
-            # interpolating to fix that.
-            other_normalized = np.interp(
-                    self.freq_bins, other.freq_bins, other_psd)
-            psd -= other_normalized
-            psd[psd < 0] = 0.
-        self.psd_sum = self.psd_x + self.psd_y + self.psd_z
     def set_numpy(self, numpy):
         self.numpy = numpy
     def normalize_to_frequencies(self):

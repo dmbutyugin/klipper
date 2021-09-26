@@ -29,6 +29,13 @@ SCALE = 0.0039 * FREEFALL_ACCEL # 3.9mg/LSB * Earth gravity in mm/s**2
 Accel_Measurement = collections.namedtuple(
     'Accel_Measurement', ('time', 'accel_x', 'accel_y', 'accel_z'))
 
+def write_accelerometer_data(samples, filename):
+    f = open(filename, "w")
+    f.write("#time,accel_x,accel_y,accel_z\n")
+    for t, accel_x, accel_y, accel_z in samples:
+        f.write("%.6f,%.6f,%.6f,%.6f\n" % (t, accel_x, accel_y, accel_z))
+    f.close()
+
 # Helper class to obtain measurements
 class ADXL345QueryHelper:
     def __init__(self, printer, cconn):
@@ -89,13 +96,7 @@ class ADXL345QueryHelper:
                 os.nice(20)
             except:
                 pass
-            f = open(filename, "w")
-            f.write("#time,accel_x,accel_y,accel_z\n")
-            samples = self.samples or self.get_samples()
-            for t, accel_x, accel_y, accel_z in samples:
-                f.write("%.6f,%.6f,%.6f,%.6f\n" % (
-                    t, accel_x, accel_y, accel_z))
-            f.close()
+            write_accelerometer_data(self.get_samples(), filename)
         write_proc = multiprocessing.Process(target=write_impl)
         write_proc.daemon = True
         write_proc.start()
