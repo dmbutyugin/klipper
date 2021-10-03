@@ -320,19 +320,6 @@ class ResonanceTester:
                 toolhead.dwell(0.500)
                 if len(axes) > 1:
                     gcmd.respond_info("Testing axis %s" % axis.get_name())
-
-                # Start acceleration measurements
-                raw_values = []
-                for chip_axis, chip in self.accel_chips:
-                    if axis.matches(chip_axis):
-                        aclient = chip.start_internal_client()
-                        raw_values.append((chip_axis, aclient))
-                # Store the original parameters
-                systime = self.printer.get_reactor().monotonic()
-                toolhead_info = toolhead.get_status(systime)
-                old_max_velocity = toolhead_info['max_velocity']
-                old_max_accel = toolhead_info['max_accel']
-                old_max_accel_to_decel = toolhead_info['max_accel_to_decel']
                 input_shaper = self.printer.lookup_object('input_shaper', None)
                 # Disable input shaping as appropriate
                 if input_shaper is not None and not gcmd.get_int(
@@ -342,29 +329,44 @@ class ResonanceTester:
                             "Disabled [input_shaper] for resonance testing")
                 else:
                     input_shaper = None
-                # Generate moves
-                self.test.run_test(axis, gcmd)
-                # Restore the original velocity limits
-                self.gcode.run_script_from_command(
-                        "SET_VELOCITY_LIMIT VELOCITY=%.3f ACCEL=%.3f"
-                        " ACCEL_TO_DECEL=%.3f" % (old_max_velocity,
-                                                  old_max_accel,
-                                                  old_max_accel_to_decel))
-                # Restore input shaper if it was disabled for resonance testing
-                if input_shaper is not None:
-                    input_shaper.enable_shaping()
-                    gcmd.respond_info("Re-enabled [input_shaper]")
-                # Obtain the measurement results
-                for chip_axis, aclient in raw_values:
-                    aclient.finish_measurements()
-                    if raw_name_suffix is not None:
-                        raw_name = self.get_filename(
-                                'raw_data', raw_name_suffix, axis,
-                                point if len(test_points) > 1 else None)
-                        aclient.write_to_file(raw_name)
-                        gcmd.respond_info(
-                                "Writing raw accelerometer data to "
-                                "%s file" % (raw_name,))
+                try:
+                    # Start acceleration measurements
+                    raw_values = []
+                    for chip_axis, chip in self.accel_chips:
+                        if axis.matches(chip_axis):
+                            aclient = chip.start_internal_client()
+                            raw_values.append((chip_axis, aclient))
+                    # Store the original parameters
+                    systime = self.printer.get_reactor().monotonic()
+                    toolhead_info = toolhead.get_status(systime)
+                    old_max_velocity = toolhead_info['max_velocity']
+                    old_max_accel = toolhead_info['max_accel']
+                    old_max_accel_to_decel = toolhead_info['max_accel_to_decel']
+                    # Generate moves
+                    self.test.run_test(axis, gcmd)
+                    # Restore the original velocity limits
+                    self.gcode.run_script_from_command(
+                            "SET_VELOCITY_LIMIT VELOCITY=%.3f ACCEL=%.3f"
+                            " ACCEL_TO_DECEL=%.3f" % (old_max_velocity,
+                                                      old_max_accel,
+                                                      old_max_accel_to_decel))
+                    # Obtain the measurement results
+                    for chip_axis, aclient in raw_values:
+                        aclient.finish_measurements()
+                        if raw_name_suffix is not None:
+                            raw_name = self.get_filename(
+                                    'raw_data', raw_name_suffix, axis,
+                                    point if len(test_points) > 1 else None)
+                            aclient.write_to_file(raw_name)
+                            gcmd.respond_info(
+                                    "Writing raw accelerometer data to "
+                                    "%s file" % (raw_name,))
+                finally:
+                    # Restore input shaper if it was disabled
+                    # for resonance testing
+                    if input_shaper is not None:
+                        input_shaper.enable_shaping()
+                        gcmd.respond_info("Re-enabled [input_shaper]")
                 if helper is None:
                     continue
                 for chip_axis, aclient in raw_values:
