@@ -18,11 +18,17 @@ def _parse_probe_points(config):
 class TestAxis:
     def __init__(self, axis=None, vib_dir=None):
         if axis is None:
-            self._name = "axis=%.3f,%.3f" % (vib_dir[0], vib_dir[1])
+            if vib_dir[2]:
+                self._name = "axis=" + ",".join(["%.3f" % (axis_dir,)
+                                                 for axis_dir in vib_dir])
+            else:
+                self._name = "axis=%.3f,%.3f" % (vib_dir[0], vib_dir[1])
         else:
             self._name = axis
         if vib_dir is None:
-            self._vib_dir = (1., 0.) if axis == 'x' else (0., 1.)
+            self._vib_dir = {'x': (1., 0., 0.),
+                             'y': (0., 1., 0.),
+                             'z': (0., 0., 1.)}[axis]
         else:
             s = math.sqrt(sum([d*d for d in vib_dir]))
             self._vib_dir = [d / s for d in vib_dir]
@@ -31,28 +37,33 @@ class TestAxis:
             return True
         if self._vib_dir[1] and 'y' in chip_axis:
             return True
+        if self._vib_dir[2] and 'z' in chip_axis:
+            return True
         return False
     def get_name(self):
         return self._name
     def get_point(self, l):
-        return (self._vib_dir[0] * l, self._vib_dir[1] * l)
+        return (self._vib_dir[0] * l,
+                self._vib_dir[1] * l,
+                self._vib_dir[2] * l)
 
 def _parse_axis(gcmd, raw_axis):
     if raw_axis is None:
         return None
     raw_axis = raw_axis.lower()
-    if raw_axis in ['x', 'y']:
+    if raw_axis in ['x', 'y', 'z']:
         return TestAxis(axis=raw_axis)
     dirs = raw_axis.split(',')
-    if len(dirs) != 2:
+    if len(dirs) not in [2, 3]:
         raise gcmd.error("Invalid format of axis '%s'" % (raw_axis,))
     try:
         dir_x = float(dirs[0].strip())
         dir_y = float(dirs[1].strip())
+        dir_z = 0 if len(dirs) == 2 else float(dirs[2].strip())
     except:
         raise gcmd.error(
                 "Unable to parse axis direction '%s'" % (raw_axis,))
-    return TestAxis(vib_dir=(dir_x, dir_y))
+    return TestAxis(vib_dir=(dir_x, dir_y, dir_z))
 
 class VibrationsTest:
     def __init__(self, config):
@@ -95,10 +106,11 @@ class VibrationsTest:
             toolhead.cmd_M204(self.gcode.create_gcode_command(
                 "M204", "M204", {"S": accel}))
             L = .5 * accel * t_seg**2
-            dX, dY = axis.get_point(L)
+            dX, dY, dZ = axis.get_point(L)
             nX = X + sign * dX
             nY = Y + sign * dY
-            toolhead.move([nX, nY, Z, E], max_v)
+            nZ = Z + sign * dZ
+            toolhead.move([nX, nY, nZ, E], max_v)
             toolhead.move([X, Y, Z, E], max_v)
             sign = -sign
             old_freq = freq
@@ -160,7 +172,8 @@ class PulsesTest:
             dX, dY = axis.get_point(L)
             nX = X + sign * dX
             nY = Y + sign * dY
-            toolhead.move([nX, nY, Z, E], max_v)
+            nZ = Z + sign * dZ
+            toolhead.move([nX, nY, nZ, E], max_v)
             toolhead.move([X, Y, Z, E], max_v)
             sign = -sign
             freq += 2. * t_seg * self.hz_per_sec
@@ -273,13 +286,23 @@ class ResonanceTester:
         test_method = config.getchoice('method', test_methods, 'vibrations')
         self.test = test_method(config)
         if not config.get('accel_chip_x', None):
-            self.accel_chip_names = [('xy', config.get('accel_chip').strip())]
+            self.accel_chip_names = [('xyz', config.get('accel_chip').strip())]
         else:
-            self.accel_chip_names = [
-                ('x', config.get('accel_chip_x').strip()),
-                ('y', config.get('accel_chip_y').strip())]
-            if self.accel_chip_names[0][1] == self.accel_chip_names[1][1]:
-                self.accel_chip_names = [('xy', self.accel_chip_names[0][1])]
+            accel_chip_names = [
+                ('x', config.get('accel_chip_x')),
+                ('y', config.get('accel_chip_y')),
+                ('z', config.get('accel_chip_z', None))]
+            chips = {}
+            for axis, chip_name in accel_chip_names:
+                if chip_name is None:
+                    continue
+                chip_name = chip_name.strip()
+                if chip_name not in chips:
+                    chips[chip_name] = [axis]
+                else:
+                    chips[chip_name].append(axis)
+            self.accel_chip_names = [(''.join(axes), chip_name)
+                                     for chip_name, axes in chips.items()]
         self.max_smoothing = config.getfloat('max_smoothing', None, minval=0.05)
 
         self.gcode = self.printer.lookup_object('gcode')
