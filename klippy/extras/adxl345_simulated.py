@@ -13,13 +13,14 @@ UPDATE_INTERVAL = 0.1
 
 # Results of the simulated measurements
 class ADXL345SimulatedQueryHelper:
-    def __init__(self, printer, cconn, data_rate):
+    def __init__(self, printer, cconn, data_rate, time_offset):
         self.printer = printer
         self.cconn = cconn
         print_time = printer.lookup_object('toolhead').get_last_move_time()
         self.request_start_time = self.request_end_time = print_time
         self.samples = []
         self.data_rate = data_rate
+        self.time_offset = time_offset
         # Capture input shaping parameters
         self.shaper_x = self.shaper_y = self._unity_shaper()
         input_shaper = self.printer.lookup_object('input_shaper', None)
@@ -84,6 +85,7 @@ class ADXL345SimulatedQueryHelper:
         if timestamps is None:
             timestamps = self._gen_timestamps()
         accel_bounds = self._gen_accel_bounds()
+        time_offset = self.time_offset
         nx, Ax, Tx = self.shaper_x
         ny, Ay, Ty = self.shaper_y
         nz, Az, Tz = self._unity_shaper()
@@ -103,7 +105,7 @@ class ADXL345SimulatedQueryHelper:
                 ind = idx[j]
                 res = 0.
                 for k in range(n[j]):
-                    ts = time - t[k]
+                    ts = time - t[k] - time_offset
                     i = ind[k]
                     while ts >= accel_bounds[i+1].time:
                         i += 1
@@ -144,10 +146,12 @@ class ADXL345SimulatedQueryHelper:
 class ADXL345Simulated:
     def __init__(self, config, printer=None):
         self.printer = config.get_printer() if printer is None else printer
+        self.time_offset = 0
         self.name = "simulated"
         if config:
             ADXLCommandHelper(config, self)
             self.data_rate = config.getint('rate', 3200, minval=1)
+            self.time_offset = config.getfloat('time_offset', 0.)
             if len(config.get_name().split()) > 1:
                 self.name = config.get_name().split()[-1]
         else:
@@ -197,7 +201,8 @@ class ADXL345Simulated:
             self._finish_measurements()
     def start_internal_client(self):
         cconn = self.api_dump.add_internal_client()
-        return ADXL345SimulatedQueryHelper(self.printer, cconn, self.data_rate)
+        return ADXL345SimulatedQueryHelper(self.printer, cconn, self.data_rate,
+                                           self.time_offset)
 
 def load_config(config):
     return ADXL345Simulated(config)
