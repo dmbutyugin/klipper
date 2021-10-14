@@ -131,25 +131,19 @@ class PulsesTest:
         self.gcode = self.printer.lookup_object('gcode')
         self.simulated_accelerometer = adxl345_simulated.ADXL345Simulated(
                 config=None, printer=self.printer)
-        self.multiplicity = config.getint('multiplicity', 10)
-        self.max_freq = config.getfloat('max_freq', 100., maxval=200.)
-        self.min_freq = config.getfloat('min_freq', 10., above=0.)
-        self.hz_per_sec = config.getfloat('hz_per_sec', 1.,
-                                          minval=0.1, maxval=2.)
+        self.min_freq = config.getfloat('min_freq', 1., above=0.)
+        self.test_time = config.getfloat('test_time', 125., above=0.)
         self.max_accel = config.getfloat('max_accel', 10000., above=0.)
-        self.speed = config.getfloat('test_speed', self.max_accel/1000.,
-                                     minval=self.max_accel/1600.)
+        self.pulse_t = config.getfloat('pulse_t', 0.002, above=0.)
         self.probe_points = _parse_probe_points(config)
     def get_start_test_points(self):
         return self.probe_points
     def prepare_test(self, gcmd):
-        self.freq_end = gcmd.get_float("FREQ_END", self.max_freq, maxval=200.)
         self.freq_start = gcmd.get_float("FREQ_START", self.min_freq, above=0.)
-        self.hz_per_sec = gcmd.get_float("HZ_PER_SEC", self.hz_per_sec,
-                                         above=0., maxval=2.)
-        self.test_speed = gcmd.get_float("TEST_SPEED", self.speed, above=0.)
-        self.max_test_accel = gcmd.get_float("MAX_ACCEL", self.max_accel,
-                                             above=0.)
+        self.total_test_time = gcmd.get_float(
+                "TEST_TIME", self.test_time, above=0.)
+        self.max_test_accel = gcmd.get_float(
+                "MAX_ACCEL", self.max_accel, above=0.)
         self.simulated_results = {}
     def run_test(self, axis, gcmd):
         accelerometer = self.simulated_accelerometer
@@ -157,37 +151,43 @@ class PulsesTest:
         reactor = self.printer.get_reactor()
         toolhead = self.printer.lookup_object('toolhead')
         X, Y, Z, E = toolhead.get_position()
-        sign = 1.
-        freq = self.freq_start
-        accel = self.max_test_accel
-        max_v = self.test_speed
-        accel_t = max_v / accel
         self.gcode.run_script_from_command(
                 "SET_VELOCITY_LIMIT ACCEL=%.3f ACCEL_TO_DECEL=%.3f" % (
-                    accel, accel))
+                    self.max_test_accel, self.max_test_accel))
+        # Test half-periods follow a geometric progression
+        #total_test_time = (.5 + .25 / self.hz_per_sec) / self.freq_start
+        hz_per_hz = .25 / (self.total_test_time * self.freq_start - .5)
         old_percent = 0
-        old_l = 0.
-        while freq <= self.freq_end + 0.000001:
-            half_period = .5 / freq * self.multiplicity
+        test_time = 0
+        sign = 1.
+        accel_t = self.pulse_t * .5
+        freq = self.freq_start
+        old_l = accel_t * self.max_test_accel * (.5 / freq + accel_t) * .5
+        while True:
+            half_period = .5 / freq
             if half_period < 2. * accel_t:
                 break
+            accel = self.max_test_accel * (self.freq_start / freq)
+            toolhead.cmd_M204(self.gcode.create_gcode_command(
+                "M204", "M204", {"S": accel}))
+            max_v = accel_t * accel
             l = accel * accel_t**2 + max_v * (half_period - 2.*accel_t) - old_l
             dX, dY, dZ = axis.get_point(l)
             nX = X + sign * dX
             nY = Y + sign * dY
             nZ = Z + sign * dZ
             toolhead.move([nX, nY, nZ, E], max_v)
+            test_time += half_period
             sign = -sign
             old_freq = freq
             old_l = l
-            freq += half_period * self.hz_per_sec
-            percent = math.floor((freq - self.freq_start) * 100. /
-                                 (self.freq_end - self.freq_start))
+            freq += hz_per_hz / half_period
+            percent = round(test_time * 100. / self.total_test_time)
             if percent != old_percent:
                 gcmd.respond_info("Test progress %d %%" % (percent,))
                 reactor.pause(reactor.monotonic() + 0.01)
             old_percent = percent
-        toolhead.move([X, Y, Z, E], max_v)
+        toolhead.move([X, Y, Z, E], self.max_test_accel * accel_t)
         aclient.finish_measurements()
         self.simulated_results[axis] = aclient
     def process_raw_data(self, helper, axis, raw_data):
