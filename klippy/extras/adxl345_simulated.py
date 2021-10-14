@@ -6,7 +6,6 @@
 import logging, time, multiprocessing, os
 import chelper
 from . import adxl345, motion_report, shaper_calibrate
-from adxl345 import Accel_Measurement, ADXLCommandHelper
 
 NEVER_TIME = 9999999999999999.
 UPDATE_INTERVAL = 0.1
@@ -63,7 +62,7 @@ class ADXL345SimulatedQueryHelper:
             time += time_per_sample
     def _gen_accel_bounds(self):
         next_time = NEVER_TIME
-        accel_bounds = [Accel_Measurement(0., 0., 0., 0.)]
+        accel_bounds = [adxl345.Accel_Measurement(0., 0., 0., 0.)]
         for msg in self.raw_moves:
             for move in msg['params']['data']:
                 move_time = move[0]
@@ -72,14 +71,15 @@ class ADXL345SimulatedQueryHelper:
                             "Internal error: moves captured backwards")
                 if next_time < move_time:
                     accel_bounds.append(
-                            Accel_Measurement(next_time, 0., 0., 0.))
+                            adxl345.Accel_Measurement(next_time, 0., 0., 0.))
                 ax = move[2] * move[3][0]
                 ay = move[2] * move[3][1]
                 az = move[2] * move[3][2]
-                accel_bounds.append(Accel_Measurement(move_time, ax, ay, az))
+                accel_bounds.append(
+                        adxl345.Accel_Measurement(move_time, ax, ay, az))
                 next_time = move_time + move[1]
-        accel_bounds.append(Accel_Measurement(next_time, 0., 0., 0.))
-        accel_bounds.append(Accel_Measurement(NEVER_TIME, 0., 0., 0.))
+        accel_bounds.append(adxl345.Accel_Measurement(next_time, 0., 0., 0.))
+        accel_bounds.append(adxl345.Accel_Measurement(NEVER_TIME, 0., 0., 0.))
         return accel_bounds
     def _gen_samples(self, timestamps=None):
         if timestamps is None:
@@ -113,7 +113,7 @@ class ADXL345SimulatedQueryHelper:
                     res += a[k] * accel_bounds[i][j + 1]
                     ind[k] = i
                 accel[j] = res
-            yield Accel_Measurement(time, accel[0], accel[1], accel[2])
+            yield adxl345.Accel_Measurement(time, accel[0], accel[1], accel[2])
             prev_time = time
     def get_samples(self):
         raw_moves = self.cconn.get_messages()
@@ -125,6 +125,8 @@ class ADXL345SimulatedQueryHelper:
             samples.append(sample)
         self.samples = samples
         return samples
+    def has_valid_samples(self):
+        return self.get_samples()
     def generate_samples(self, timestamps):
         raw_moves = self.cconn.get_messages()
         if raw_moves:
@@ -149,7 +151,7 @@ class ADXL345Simulated:
         self.time_offset = 0
         self.name = "simulated"
         if config:
-            ADXLCommandHelper(config, self)
+            adxl345.ADXLCommandHelper(config, self)
             self.data_rate = config.getint('rate', 3200, minval=1)
             self.time_offset = config.getfloat('time_offset', 0.)
             if len(config.get_name().split()) > 1:
