@@ -50,10 +50,10 @@ class VibrationPulseTest:
         self.printer = config.get_printer()
         self.gcode = self.printer.lookup_object('gcode')
         self.min_freq = config.getfloat('min_freq', 5., minval=1.)
-        # Defaults are such that max_freq * accel_per_hz == 10000 (max_accel)
-        self.max_freq = config.getfloat('max_freq', 10000. / 75.,
+        self.max_freq = config.getfloat('max_freq', 205.,
                                         minval=self.min_freq, maxval=200.)
-        self.accel_per_hz = config.getfloat('accel_per_hz', 75., above=0.)
+        self.accel = config.getfloat('accel', None, above=0.)
+        self.min_v = config.getfloat('min_velocity', None, above=0.)
         self.hz_per_sec = config.getfloat('hz_per_sec', 1.,
                                           minval=0.1, maxval=2.)
 
@@ -65,55 +65,58 @@ class VibrationPulseTest:
         self.freq_start = gcmd.get_float("FREQ_START", self.min_freq, minval=1.)
         self.freq_end = gcmd.get_float("FREQ_END", self.max_freq,
                                        minval=self.freq_start, maxval=200.)
+        self.test_accel = gcmd.get_float("ACCEL", self.accel, above=0.)
+        self.min_test_v = gcmd.get_float("MIN_VELOCITY", self.min_v, above=0.)
         self.hz_per_sec = gcmd.get_float("HZ_PER_SEC", self.hz_per_sec,
                                          above=0., maxval=2.)
     def run_test(self, axis, gcmd):
+        reactor = self.printer.get_reactor()
         toolhead = self.printer.lookup_object('toolhead')
         X, Y, Z, E = toolhead.get_position()
-        sign = 1.
-        freq = self.freq_start
         # Override maximum acceleration and acceleration to
         # deceleration based on the maximum test frequency
         systime = self.printer.get_reactor().monotonic()
         toolhead_info = toolhead.get_status(systime)
+        old_max_v = toolhead_info['max_velocity']
         old_max_accel = toolhead_info['max_accel']
         old_max_accel_to_decel = toolhead_info['max_accel_to_decel']
-        max_accel = self.freq_end * self.accel_per_hz
+        old_scv = toolhead_info['square_corner_velocity']
+        test_accel = self.test_accel or old_max_accel_to_decel
+        min_v = self.min_test_v or old_scv
+        max_v = max(.25 * test_accel / self.freq_start, min_v)
+        max_accel = max(test_accel, 4. * min_v * self.freq_end)
         self.gcode.run_script_from_command(
-                "SET_VELOCITY_LIMIT ACCEL=%.3f ACCEL_TO_DECEL=%.3f" % (
-                    max_accel, max_accel))
-        input_shaper = self.printer.lookup_object('input_shaper', None)
-        if input_shaper is not None and not gcmd.get_int('INPUT_SHAPING', 0):
-            input_shaper.disable_shaping()
-            gcmd.respond_info("Disabled [input_shaper] for resonance testing")
-        else:
-            input_shaper = None
+                "SET_VELOCITY_LIMIT VELOCITY=%.3f"
+                " ACCEL=%.3f ACCEL_TO_DECEL=%.3f" % (
+                    max_v, max_accel, max_accel))
+        oldL = test_accel / self.freq_start**2 / 32.
+        sign = 1.
+        freq = self.freq_start
         gcmd.respond_info("Testing frequency %.0f Hz" % (freq,))
         while freq <= self.freq_end + 0.000001:
-            t_seg = .25 / freq
-            accel = self.accel_per_hz * freq
-            max_v = accel * t_seg
+            t_seg = .5 / freq
+            V = max(test_accel * t_seg * .5, min_v)
+            accel = 2. * V / t_seg
             toolhead.cmd_M204(self.gcode.create_gcode_command(
                 "M204", "M204", {"S": accel}))
-            L = .5 * accel * t_seg**2
+            L = .25 * accel * t_seg**2 - oldL
             dX, dY = axis.get_point(L)
             nX = X + sign * dX
             nY = Y + sign * dY
-            toolhead.move([nX, nY, Z, E], max_v)
-            toolhead.move([X, Y, Z, E], max_v)
+            toolhead.move([nX, nY, Z, E], V)
             sign = -sign
             old_freq = freq
-            freq += 2. * t_seg * self.hz_per_sec
+            freq += t_seg * self.hz_per_sec * (accel / test_accel)**2
+            oldL = L
             if math.floor(freq) > math.floor(old_freq):
                 gcmd.respond_info("Testing frequency %.0f Hz" % (freq,))
+                reactor.pause(reactor.monotonic() + 0.01)
         # Restore the original acceleration values
         self.gcode.run_script_from_command(
-                "SET_VELOCITY_LIMIT ACCEL=%.3f ACCEL_TO_DECEL=%.3f" % (
-                    old_max_accel, old_max_accel_to_decel))
-        # Restore input shaper if it was disabled for resonance testing
-        if input_shaper is not None:
-            input_shaper.enable_shaping()
-            gcmd.respond_info("Re-enabled [input_shaper]")
+                "SET_VELOCITY_LIMIT VELOCITY=%.3f"
+                " ACCEL=%.3f ACCEL_TO_DECEL=%.3f" % (
+                    old_max_v, old_max_accel, old_max_accel_to_decel))
+        toolhead.move([X, Y, Z, E], max_v)
 
 class ResonanceTester:
     def __init__(self, config):
@@ -178,24 +181,41 @@ class ResonanceTester:
                 toolhead.dwell(0.500)
                 if len(axes) > 1:
                     gcmd.respond_info("Testing axis %s" % axis.get_name())
-
-                raw_values = []
-                for chip_axis, chip in self.accel_chips:
-                    if axis.matches(chip_axis):
-                        aclient = chip.start_internal_client()
-                        raw_values.append((chip_axis, aclient))
-                # Generate moves
-                self.test.run_test(axis, gcmd)
-                for chip_axis, aclient in raw_values:
-                    aclient.finish_measurements()
-                    if raw_name_suffix is not None:
-                        raw_name = self.get_filename(
-                                'raw_data', raw_name_suffix, axis,
-                                point if len(test_points) > 1 else None)
-                        aclient.write_to_file(raw_name)
-                        gcmd.respond_info(
-                                "Writing raw accelerometer data to "
-                                "%s file" % (raw_name,))
+                input_shaper = self.printer.lookup_object('input_shaper', None)
+                # Disable input shaping as appropriate
+                if input_shaper is not None and not gcmd.get_int(
+                        'INPUT_SHAPING', 0):
+                    input_shaper.disable_shaping()
+                    gcmd.respond_info(
+                            "Disabled [input_shaper] for resonance testing")
+                else:
+                    input_shaper = None
+                try:
+                    # Start acceleration measurements
+                    raw_values = []
+                    for chip_axis, chip in self.accel_chips:
+                        if axis.matches(chip_axis):
+                            aclient = chip.start_internal_client()
+                            raw_values.append((chip_axis, aclient))
+                    # Generate moves
+                    self.test.run_test(axis, gcmd)
+                    # Obtain the measurement results
+                    for chip_axis, aclient in raw_values:
+                        aclient.finish_measurements()
+                        if raw_name_suffix is not None:
+                            raw_name = self.get_filename(
+                                    'raw_data', raw_name_suffix, axis,
+                                    point if len(test_points) > 1 else None)
+                            aclient.write_to_file(raw_name)
+                            gcmd.respond_info(
+                                    "Writing raw accelerometer data to "
+                                    "%s file" % (raw_name,))
+                finally:
+                    # Restore input shaper if it was disabled
+                    # for resonance testing
+                    if input_shaper is not None:
+                        input_shaper.enable_shaping()
+                        gcmd.respond_info("Re-enabled [input_shaper]")
                 if helper is None:
                     continue
                 for chip_axis, aclient in raw_values:
