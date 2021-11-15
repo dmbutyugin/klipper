@@ -227,7 +227,6 @@ class ADXL345:
     def __init__(self, config):
         self.printer = config.get_printer()
         ADXLCommandHelper(config, self)
-        self.query_rate = 0
         gravity = config.getfloatlist('gravity', (0., 0., 0.), count=3)
         axes_transform = config.getlists(
                 'axes_transform', None, seps=(',', '\n'), parser=float, count=3)
@@ -247,6 +246,9 @@ class ADXL345:
         self.data_rate = config.getint('rate', 3200)
         if self.data_rate not in QUERY_RATES:
             raise config.error("Invalid rate parameter: %d" % (self.data_rate,))
+        # A lock to guard start/stop process and make it atomic
+        self.start_stop_lock = threading.Lock()
+        self.query_rate = 0
         # Measurement storage (accessed from background thread)
         self.lock = threading.Lock()
         self.raw_samples = []
@@ -438,10 +440,18 @@ class ADXL345:
         return {'data': samples, 'errors': self.last_error_count,
                 'overflows': self.last_limit_count}
     def _api_startstop(self, is_start):
-        if is_start:
-            self._start_measurements()
-        else:
-            self._finish_measurements()
+        reactor = self.printer.get_reactor()
+        # Do not block, especially the main Klipper thread, but instead give way
+        # to other threads to prevent deadlocks
+        while not self.start_stop_lock.acquire(False):
+            reactor.pause(reactor.monotonic() + 0.1)
+        try:
+            if is_start:
+                self._start_measurements()
+            else:
+                self._finish_measurements()
+        finally:
+            self.start_stop_lock.release()
     def _handle_dump_adxl345(self, web_request):
         self.api_dump.add_client(web_request)
         hdr = ('time', 'x_acceleration', 'y_acceleration', 'z_acceleration')
