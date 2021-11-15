@@ -3,8 +3,8 @@
 # Copyright (C) 2020-2021  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging, time, collections, threading, multiprocessing, os
-from . import bus, motion_report
+import logging, math, time, collections, threading, multiprocessing, os
+from . import bus, motion_report, shaper_calibrate
 
 # ADXL345 registers
 REG_DEVID = 0x00
@@ -25,6 +25,9 @@ SET_FIFO_CTL = 0x90
 
 FREEFALL_ACCEL = 9.80665 * 1000.
 SCALE = 0.0039 * FREEFALL_ACCEL # 3.9mg/LSB * Earth gravity in mm/s**2
+
+CALIBRATION_NOISE_THRESHOLD = 1e4
+ACCELERATION_OUTLIER_THRESHOLD = FREEFALL_ACCEL * 5.
 
 Accel_Measurement = collections.namedtuple(
     'Accel_Measurement', ('time', 'accel_x', 'accel_y', 'accel_z'))
@@ -82,6 +85,8 @@ class ADXL345QueryHelper:
                 count += 1
         del samples[count:]
         return self.samples
+    def get_measurements_range(self):
+        return (self.request_start_time, self.request_end_time)
     def write_to_file(self, filename):
         def write_impl():
             try:
@@ -99,6 +104,221 @@ class ADXL345QueryHelper:
         write_proc = multiprocessing.Process(target=write_impl)
         write_proc.daemon = True
         write_proc.start()
+
+class AccelerometerCalibrator:
+    def __init__(self, printer, chip):
+        self.printer = printer
+        self.gcode = self.printer.lookup_object('gcode')
+        self.chip = chip
+        # Test parameters
+        self.max_accel = 500.
+        self.wait_test_sec = 5.
+        self.move_test_runs = 15
+        self.move_test_len = 4. # Should work well with GT-2 belts
+    def _run_wait_test(self, toolhead):
+        aclient = self.chip.start_internal_client()
+        toolhead.dwell(self.wait_test_sec)
+        aclient.finish_measurements()
+        return aclient
+    def _run_move_test(self, toolhead, axis_dir):
+        X, Y, Z, E = toolhead.get_position()
+        systime = self.printer.get_reactor().monotonic()
+        toolhead_info = toolhead.get_status(systime)
+        max_accel = toolhead_info['max_accel']
+        max_accel_to_decel = toolhead_info['max_accel_to_decel']
+        # The test runs as follows:
+        # * accelerate for t_seg/2 time
+        # * cruise for t_seg time
+        # * decelerate for t_seg/2 time
+        # * accelerate for t_seg/2 time in reverse direction
+        # .....
+        L = self.move_test_len
+        accel = min(self.max_accel, 6. * max_accel_to_decel, max_accel)
+        t_seg = math.sqrt(L / (.75 * accel))
+        freq = .25 / t_seg
+        max_v = .5 * t_seg * accel
+        toolhead.cmd_M204(self.gcode.create_gcode_command(
+            'M204', 'M204', {'S': accel}))
+        nX = X + axis_dir[0] * L
+        nY = Y + axis_dir[1] * L
+        aclient = self.chip.start_internal_client()
+        try:
+            for i in range(self.move_test_runs):
+                toolhead.move([nX, nY, Z, E], max_v)
+                toolhead.move([X, Y, Z, E], max_v)
+        finally:
+            aclient.finish_measurements()
+        toolhead.cmd_M204(self.gcode.create_gcode_command(
+            'M204', 'M204', {'S': max_accel}))
+        return (freq, accel, aclient)
+    def _integrate(self, samples, t_range):
+        avg = samples[(samples[:,0] >= t_range[0]) &
+                      (samples[:,0] < t_range[1])].mean(axis=0)
+        return avg[1:]
+    def _compute_freefall_accel(self, data):
+        samples = self.np.asarray(data.get_samples())
+        g = self._integrate(samples, data.get_measurements_range())
+        freefall_accel = self.np.linalg.norm(g)
+        return freefall_accel, g
+    def _compute_measured_accel(self, freq, data):
+        start_t, end_t = data.get_measurements_range()
+        samples = self.np.asarray(data.get_samples())
+        quarter_period = .25 / freq
+        a = self.np.zeros(shape=3)
+        n = 0
+        sign = 1
+        while end_t - start_t > quarter_period:
+            a += sign * self._integrate(
+                    samples, (start_t, start_t + quarter_period))
+            start_t += quarter_period
+            a -= sign * self._integrate(
+                    samples, (start_t, start_t + quarter_period))
+            start_t += quarter_period
+            sign = -sign
+            n += 2
+        # Acceleration is active only half of the time
+        a *= 2. / n
+        measured_acccel = self.np.linalg.norm(a)
+        return measured_acccel, a
+    def _calculate_gravity(self):
+        self.gravity = [round(FREEFALL_ACCEL * coeff, 1)
+                        for coeff in self.results['z']]
+    def _calculate_axes_transform(self):
+        linalg = self.np.linalg
+        A = self.np.zeros(shape=(3, 3))
+        if 'x' in self.results:
+            A[:,0] = self.results['x']
+        else:
+            a_y = self.np.asarray(self.results['y'])
+            a_z = self.np.asarray(self.results['z'])
+            # Exact X axis direction does not matter, so
+            # creating the standard right-handed coordinate system
+            a_x = self.np.cross(a_y, a_z)
+            # Normalize to the same scale as Y axis
+            a_x *= linalg.norm(a_y) / linalg.norm(a_x)
+            A[:,0] = a_x
+        if 'y' in self.results:
+            A[:,1] = self.results['y']
+        else:
+            a_x = self.np.asarray(self.results['x'])
+            a_z = self.np.asarray(self.results['z'])
+            # Exact Y axis direction does not matter, so
+            # creating the standard right-handed coordinate system
+            a_y = self.np.cross(a_z, a_x)
+            # Normalize to the same scale as X axis
+            a_y *= linalg.norm(a_x) / linalg.norm(a_y)
+            A[:,1] = a_y
+        A[:,2] = self.results['z']
+        self.axes_transform = linalg.inv(A)
+    def _get_chip_name(self):
+        return self.chip.get_config().get_name()
+    def _save_gravity(self, gcmd):
+        chip_name = self._get_chip_name()
+        str_val = ','.join(['%.1f' % (coeff,) for coeff in self.gravity])
+        configfile = self.printer.lookup_object('configfile')
+        configfile.set(chip_name, 'gravity', str_val)
+        self.chip.set_transform(self.axes_transform, self.gravity)
+        gcmd.respond_info(
+                'SAVE_CONFIG command will update %s configuration with '
+                'gravity = %s parameter' % (chip_name, str_val))
+    def _save_axes_transform(self, gcmd):
+        chip_name = self._get_chip_name()
+        configfile = self.printer.lookup_object('configfile')
+        if self.chip.get_config().get('axes_map', None, note_valid=False):
+            configfile.set(chip_name, 'axes_map', '')
+        str_val = '\n'.join([','.join(['%.9f' % (coeff,) for coeff in axis])
+                             for axis in self.axes_transform])
+        configfile.set(chip_name, 'axes_transform', '\n' + str_val)
+        self.chip.set_transform(self.axes_transform, self.gravity)
+        gcmd.respond_info(
+                'SAVE_CONFIG command will also update %s configuration with '
+                'axes_transform =\n%s' % (chip_name, str_val))
+    def _calibrate_z_axis(self, toolhead, gcmd):
+        gcmd.respond_info('Calibrating z axis')
+        data = self._run_wait_test(toolhead)
+        if not data.has_valid_samples():
+            raise gcmd.error('No accelerometer measurements found')
+        for _, ax, ay, az in data.get_samples():
+            if max(ax, ay, az) > ACCELERATION_OUTLIER_THRESHOLD:
+                gcmd.respond_info(
+                        'WARNING: large acceleration reading detected (%.1f '
+                        'mm/sec^2). This generally indicates communication '
+                        'errors with the accelerometer (e.g. because of '
+                        'electromagnetic interference on the cables or '
+                        'problems with the sensor). This may severerly impact '
+                        'the calibration and resonance testing results.' % (
+                            max(ax, ay, az),))
+                break
+        helper = shaper_calibrate.ShaperCalibrate(self.printer)
+        processed_data = helper.process_accelerometer_data(data)
+        psd = processed_data.get_psd()
+        max_noise_ind = psd.argmax()
+        if psd[max_noise_ind] > CALIBRATION_NOISE_THRESHOLD:
+            gcmd.respond_info(
+                    'WARNING: strong periodic noise detected at %.1f Hz. This '
+                    'could be a loud unbalanced fan or some other devices '
+                    'working nearby. Please turn off fans (e.g. hotend fan) '
+                    'and other sources of vibrations for accelerometer '
+                    'calibration and resonance testing for best results.' % (
+                        processed_data.get_freq_bins()[max_noise_ind],))
+        self.np = processed_data.get_numpy()
+        freefall_accel, g = self._compute_freefall_accel(data)
+        if abs(freefall_accel - FREEFALL_ACCEL) > .2 * FREEFALL_ACCEL:
+            chip_name = self._get_chip_name()
+            raise gcmd.error('%s is defunct: measured invalid freefall accel '
+                             '%.3f (mm/sec^2) vs ~ %.3f (mm/sec^2)' % (
+                                 chip_name, freefall_accel, FREEFALL_ACCEL))
+        self.results['z'] = g / FREEFALL_ACCEL
+        self._calculate_gravity()
+        gcmd.respond_info(
+                'Detected gravity direction: %s' % (', '.join(
+                    ['%.6f' % (val,) for val in self.results['z']])))
+        self._save_gravity(gcmd)
+    def _calibrate_xy_axis(self, axis, axis_dir, toolhead, gcmd):
+        gcmd.respond_info('Calibrating %s axis' % (axis,))
+        chip_name = self._get_chip_name()
+        freq, accel, data = self._run_move_test(toolhead, axis_dir)
+        if not data.has_valid_samples():
+            raise gcmd.error('No accelerometer measurements found')
+        measured_acccel, a = self._compute_measured_accel(freq, data)
+        if measured_acccel > .2 * accel:
+            if abs(measured_acccel - accel) > .2 * accel:
+                raise gcmd.error(
+                        '%s measured spurious acceleration on %s axis: '
+                        '%.3f vs %.3f (mm/sec^2)' % (chip_name, axis,
+                                                     measured_acccel, accel))
+            self.results[axis] = a / accel
+            gcmd.respond_info(
+                    'Detected %s direction: %s' % (axis, ', '.join(
+                        ['%.6f' % (val,) for val in self.results[axis]])))
+        else:
+            gcmd.respond_info('%s is not kinematically connected to the '
+                              'movement of %s axis' % (chip_name, axis))
+    def calibrate(self, gcmd):
+        toolhead = self.printer.lookup_object('toolhead')
+        reactor = self.printer.get_reactor()
+        # Reset adxl345 transformations
+        self.axes_transform = [[1., 0., 0.],
+                               [0., 1., 0.],
+                               [0., 0., 1.]]
+        self.gravity = [0., 0., 0.]
+        self.chip.set_transform(self.axes_transform, self.gravity)
+        self.results = {}
+        self._calibrate_z_axis(toolhead, gcmd)
+        reactor.pause(reactor.monotonic() + 0.1)
+        self._calibrate_xy_axis('x', (1., 0.), toolhead, gcmd)
+        reactor.pause(reactor.monotonic() + 0.1)
+        self._calibrate_xy_axis('y', (0., 1.), toolhead, gcmd)
+        reactor.pause(reactor.monotonic() + 0.1)
+        if 'x' not in self.results and 'y' not in self.results:
+            raise gcmd.error(
+                    '%s is not kinematically connected to either of X or '
+                    'Y printer axis, impossible to calibrate automatically. '
+                    'Please manually set axes_map parameter.' % (
+                        self._get_chip_name(),))
+        gcmd.respond_info('Computing axes transform')
+        self._calculate_axes_transform()
+        self._save_axes_transform(gcmd)
 
 # Helper class for G-Code commands
 class ADXLCommandHelper:
@@ -119,6 +339,9 @@ class ADXLCommandHelper:
         gcode.register_mux_command("ACCELEROMETER_QUERY", "CHIP", name,
                                    self.cmd_ACCELEROMETER_QUERY,
                                    desc=self.cmd_ACCELEROMETER_QUERY_help)
+        gcode.register_mux_command("ACCELEROMETER_CALIBRATE", "CHIP", name,
+                                   self.cmd_ACCELEROMETER_CALIBRATE,
+                                   desc=self.cmd_ACCELEROMETER_CALIBRATE_help)
         gcode.register_mux_command("ACCELEROMETER_DEBUG_READ", "CHIP", name,
                                    self.cmd_ACCELEROMETER_DEBUG_READ,
                                    desc=self.cmd_ACCELEROMETER_DEBUG_READ_help)
@@ -158,6 +381,9 @@ class ADXLCommandHelper:
         _, accel_x, accel_y, accel_z = values[-1]
         gcmd.respond_info("adxl345 values (x, y, z): %.6f, %.6f, %.6f"
                           % (accel_x, accel_y, accel_z))
+    cmd_ACCELEROMETER_CALIBRATE_help = "Automatically calibrate accelerometer"
+    def cmd_ACCELEROMETER_CALIBRATE(self, gcmd):
+        AccelerometerCalibrator(self.printer, self.chip).calibrate(gcmd)
     cmd_ACCELEROMETER_DEBUG_READ_help = "Query adxl345 register (for debugging)"
     def cmd_ACCELEROMETER_DEBUG_READ(self, gcmd):
         reg = gcmd.get("REG", minval=29, maxval=57, parser=lambda x: int(x, 0))
@@ -225,6 +451,7 @@ SAMPLES_PER_BLOCK = 10
 # Printer class that controls ADXL345 chip
 class ADXL345:
     def __init__(self, config):
+        self.config = config
         self.printer = config.get_printer()
         ADXLCommandHelper(config, self)
         gravity = config.getfloatlist('gravity', (0., 0., 0.), count=3)
@@ -300,6 +527,8 @@ class ADXL345:
                     "This is generally indicative of connection problems "
                     "(e.g. faulty wiring) or a faulty adxl345 chip." % (
                         reg, val, stored_val))
+    def get_config(self):
+        return self.config
     def set_transform(self, axes_transform, gravity):
         self.gravity = [coeff / SCALE for coeff in gravity]
         self.axes_transform = [[coeff * SCALE for coeff in axis]
