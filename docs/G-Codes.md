@@ -757,6 +757,11 @@ The following commands are available when an
   format. If the accelerometer does not have a name in its config
   section (simply `[adxl345]`) then `<chip>` part of the name is not
   generated.
+- `ACCELEROMETER_CALIBRATE [CHIP=<config_name>]`: runs an automatic
+  calibration test to detect chip orientation and freefall acceleration.
+  The results of the calibration are applied to all subsequent
+  measurements, and can be persisted in `printer.cfg` by issuing
+  `SAVE_CONFIG` command afterwards.
 - `ACCELEROMETER_QUERY [CHIP=<config_name>] [RATE=<value>]`: queries
   accelerometer for the current value. If CHIP is not specified it
   defaults to "adxl345". If RATE is not specified, the default value
