@@ -233,11 +233,14 @@ class AccelerometerCalibrator:
         gcmd.respond_info(
                 'SAVE_CONFIG command will also update %s configuration with '
                 'axes_transform =\n%s' % (chip_name, str_val))
-    def _calibrate_z_axis(self, toolhead, gcmd):
+    def _calibrate_z_axis(self, toolhead, gcmd, output):
         gcmd.respond_info('Calibrating z axis')
         data = self._run_wait_test(toolhead)
         if not data.has_valid_samples():
             raise gcmd.error('No accelerometer measurements found')
+        if output is not None:
+            filename = "/tmp/%s-z.csv" % (output,)
+            data.write_to_file(filename)
         for _, ax, ay, az in data.get_samples():
             if max(ax, ay, az) > ACCELERATION_OUTLIER_THRESHOLD:
                 gcmd.respond_info(
@@ -274,12 +277,15 @@ class AccelerometerCalibrator:
                 'Detected gravity direction: %s' % (', '.join(
                     ['%.6f' % (val,) for val in self.results['z']])))
         self._save_gravity(gcmd)
-    def _calibrate_xy_axis(self, axis, axis_dir, toolhead, gcmd):
+    def _calibrate_xy_axis(self, axis, axis_dir, toolhead, gcmd, output):
         gcmd.respond_info('Calibrating %s axis' % (axis,))
         chip_name = self._get_chip_name()
         freq, accel, data = self._run_move_test(toolhead, axis_dir)
         if not data.has_valid_samples():
             raise gcmd.error('No accelerometer measurements found')
+        if output is not None:
+            filename = "/tmp/%s-%s.csv" % (output, axis)
+            data.write_to_file(filename)
         measured_acccel, a = self._compute_measured_accel(freq, data)
         if measured_acccel > .2 * accel:
             if abs(measured_acccel - accel) > .2 * accel:
@@ -294,7 +300,7 @@ class AccelerometerCalibrator:
         else:
             gcmd.respond_info('%s is not kinematically connected to the '
                               'movement of %s axis' % (chip_name, axis))
-    def calibrate(self, gcmd):
+    def calibrate(self, gcmd, output=None):
         toolhead = self.printer.lookup_object('toolhead')
         reactor = self.printer.get_reactor()
         # Reset adxl345 transformations
@@ -304,11 +310,11 @@ class AccelerometerCalibrator:
         self.gravity = [0., 0., 0.]
         self.chip.set_transform(self.axes_transform, self.gravity)
         self.results = {}
-        self._calibrate_z_axis(toolhead, gcmd)
+        self._calibrate_z_axis(toolhead, gcmd, output)
         reactor.pause(reactor.monotonic() + 0.1)
-        self._calibrate_xy_axis('x', (1., 0.), toolhead, gcmd)
+        self._calibrate_xy_axis('x', (1., 0.), toolhead, gcmd, output)
         reactor.pause(reactor.monotonic() + 0.1)
-        self._calibrate_xy_axis('y', (0., 1.), toolhead, gcmd)
+        self._calibrate_xy_axis('y', (0., 1.), toolhead, gcmd, output)
         reactor.pause(reactor.monotonic() + 0.1)
         if 'x' not in self.results and 'y' not in self.results:
             raise gcmd.error(
@@ -383,7 +389,10 @@ class ADXLCommandHelper:
                           % (accel_x, accel_y, accel_z))
     cmd_ACCELEROMETER_CALIBRATE_help = "Automatically calibrate accelerometer"
     def cmd_ACCELEROMETER_CALIBRATE(self, gcmd):
-        AccelerometerCalibrator(self.printer, self.chip).calibrate(gcmd)
+        output = gcmd.get("OUTPUT", None)
+        if not output.replace('-', '').replace('_', '').isalnum():
+            raise gcmd.error("Invalid OUTPUT parameter")
+        AccelerometerCalibrator(self.printer, self.chip).calibrate(gcmd, output)
     cmd_ACCELEROMETER_DEBUG_READ_help = "Query adxl345 register (for debugging)"
     def cmd_ACCELEROMETER_DEBUG_READ(self, gcmd):
         reg = gcmd.get("REG", minval=29, maxval=57, parser=lambda x: int(x, 0))
