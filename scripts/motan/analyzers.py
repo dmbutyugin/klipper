@@ -4,6 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import math, collections
+import numpy as np
 import readlog
 
 
@@ -204,6 +205,37 @@ class GenDeviation:
         return [d1 - d2 for d1, d2 in zip(data1, data2)]
 AHandlers["deviation"] = GenDeviation
 
+class GenAverageBy:
+    ParametersMin = ParametersMax = 2
+    DataSets = [
+        ('average_by(<dataset1>,<dataset2>)',
+            'Map values from dataset1 to dataset2 by time and avergage values '
+            'from dataset1 with the same values in dataset2'),
+    ]
+    def __init__(self, amanager, name_parts):
+        self.amanager = amanager
+        self.source1, self.source2 = name_parts[1:]
+        amanager.setup_dataset(self.source1)
+        amanager.setup_dataset(self.source2)
+    def get_label(self):
+        label1 = self.amanager.get_label(self.source1)
+        label2 = self.amanager.get_label(self.source2)
+        return {'label': label1['label'], 'units': label2['label']}
+    def generate_data(self):
+        datasets = self.amanager.get_datasets()
+        data1 = np.asarray(datasets[self.source1])
+        data2 = np.asarray(datasets[self.source2])
+        sort_ind = np.argsort(data2)
+        sorted_data2 = data2[sort_ind]
+        sorted_data1 = data1[sort_ind]
+        _, indices, inverse, counts = np.unique(
+                sorted_data2, return_index=True,
+                return_inverse=True, return_counts=True)
+        data1_by_data2 = np.add.reduceat(sorted_data1, indices) / counts
+        data1_remapped = np.zeros(shape=data1.shape)
+        data1_remapped[sort_ind] = data1_by_data2[inverse]
+        return data1_remapped
+AHandlers["average_by"] = GenAverageBy
 
 ######################################################################
 # Analyzer management and data generation
