@@ -6,6 +6,8 @@
 import logging, math, os, time
 from . import shaper_calibrate
 
+MAX_FREQ = 500.
+
 class TestAxis:
     def __init__(self, axis=None, vib_dir=None):
         if axis is None:
@@ -52,19 +54,21 @@ class VibrationPulseTest:
         self.min_freq = config.getfloat('min_freq', 5., minval=1.)
         # Defaults are such that max_freq * accel_per_hz == 10000 (max_accel)
         self.max_freq = config.getfloat('max_freq', 10000. / 75.,
-                                        minval=self.min_freq, maxval=200.)
+                                        minval=self.min_freq, maxval=MAX_FREQ)
         self.accel_per_hz = config.getfloat('accel_per_hz', 75., above=0.)
         self.hz_per_sec = config.getfloat('hz_per_sec', 1.,
                                           minval=0.1, maxval=2.)
 
         self.probe_points = config.getlists('probe_points', seps=(',', '\n'),
                                             parser=float, count=3)
+    def get_max_freq(self):
+        return self.max_freq
     def get_start_test_points(self):
         return self.probe_points
     def prepare_test(self, gcmd):
         self.freq_start = gcmd.get_float("FREQ_START", self.min_freq, minval=1.)
         self.freq_end = gcmd.get_float("FREQ_END", self.max_freq,
-                                       minval=self.freq_start, maxval=200.)
+                                       minval=self.freq_start, maxval=MAX_FREQ)
         self.hz_per_sec = gcmd.get_float("HZ_PER_SEC", self.hz_per_sec,
                                          above=0., maxval=2.)
     def run_test(self, axis, gcmd):
@@ -259,7 +263,8 @@ class ResonanceTester:
                     % (axis_name,))
             calibration_data[axis].normalize_to_frequencies()
             best_shaper, all_shapers = helper.find_best_shaper(
-                    calibration_data[axis], max_smoothing, gcmd.respond_info)
+                    calibration_data[axis], self.test.get_max_freq() * 1.5,
+                    max_smoothing, gcmd.respond_info)
             gcmd.respond_info(
                     "Recommended shaper_type_%s = %s, shaper_freq_%s = %.1f Hz"
                     % (axis_name, best_shaper.name,
@@ -311,8 +316,8 @@ class ResonanceTester:
     def save_calibration_data(self, base_name, name_suffix, shaper_calibrate,
                               axis, calibration_data, all_shapers=None):
         output = self.get_filename(base_name, name_suffix, axis)
-        shaper_calibrate.save_calibration_data(output, calibration_data,
-                                               all_shapers)
+        shaper_calibrate.save_calibration_data(output, MAX_FREQ,
+                                               calibration_data, all_shapers)
         return output
 
 def load_config(config):

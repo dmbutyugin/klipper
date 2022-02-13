@@ -7,9 +7,7 @@ import collections, importlib, logging, math, multiprocessing
 shaper_defs = importlib.import_module('.shaper_defs', 'extras')
 
 MIN_FREQ = 5.
-MAX_FREQ = 200.
 WINDOW_T_SEC = 0.5
-MAX_SHAPER_FREQ = 150.
 
 TEST_DAMPING_RATIOS=[0.075, 0.1, 0.15]
 
@@ -227,14 +225,14 @@ class ShaperCalibrate:
         offset_180 *= inv_D
         return max(offset_90, offset_180)
 
-    def fit_shaper(self, shaper_cfg, calibration_data, max_smoothing):
+    def fit_shaper(self, shaper_cfg, calibration_data, max_freq, max_smoothing):
         np = self.numpy
 
-        test_freqs = np.arange(shaper_cfg.min_freq, MAX_SHAPER_FREQ, .2)
+        test_freqs = np.arange(shaper_cfg.min_freq, max_freq * 0.75, .2)
 
         freq_bins = calibration_data.freq_bins
-        psd = calibration_data.psd_sum[freq_bins <= MAX_FREQ]
-        freq_bins = freq_bins[freq_bins <= MAX_FREQ]
+        psd = calibration_data.psd_sum[freq_bins <= max_freq]
+        freq_bins = freq_bins[freq_bins <= max_freq]
 
         best_res = None
         results = []
@@ -300,14 +298,15 @@ class ShaperCalibrate:
             shaper, test_accel) <= TARGET_SMOOTHING)
         return max_accel
 
-    def find_best_shaper(self, calibration_data, max_smoothing, logger=None):
+    def find_best_shaper(self, calibration_data, max_freq, max_smoothing,
+                         logger=None):
         best_shaper = None
         all_shapers = []
         for shaper_cfg in shaper_defs.INPUT_SHAPERS:
             if shaper_cfg.name not in AUTOTUNE_SHAPERS:
                 continue
             shaper = self.background_process_exec(self.fit_shaper, (
-                shaper_cfg, calibration_data, max_smoothing))
+                shaper_cfg, calibration_data, max_freq, max_smoothing))
             if logger is not None:
                 logger("Fitted shaper '%s' frequency = %.1f Hz "
                        "(vibrations = %.1f%%, smoothing ~= %.3f)" % (
@@ -334,7 +333,8 @@ class ShaperCalibrate:
             configfile.set('input_shaper', 'shaper_freq_'+axis,
                            '%.1f' % (shaper_freq,))
 
-    def save_calibration_data(self, output, calibration_data, shapers=None):
+    def save_calibration_data(self, output, max_freq, calibration_data,
+                              shapers=None):
         try:
             with open(output, "w") as csvfile:
                 csvfile.write("freq,psd_x,psd_y,psd_z,psd_xyz")
@@ -344,7 +344,7 @@ class ShaperCalibrate:
                 csvfile.write("\n")
                 num_freqs = calibration_data.freq_bins.shape[0]
                 for i in range(num_freqs):
-                    if calibration_data.freq_bins[i] >= MAX_FREQ:
+                    if calibration_data.freq_bins[i] >= max_freq:
                         break
                     csvfile.write("%.1f,%.3e,%.3e,%.3e,%.3e" % (
                         calibration_data.freq_bins[i],

@@ -154,12 +154,12 @@ def plot_specgram(data, logname, max_freq, axis):
 # CSV output
 ######################################################################
 
-def write_frequency_response(datas, output):
+def write_frequency_response(datas, max_freq, output):
     helper = shaper_calibrate.ShaperCalibrate(printer=None)
     calibration_data = helper.process_accelerometer_data(datas[0])
     for data in datas[1:]:
         calibration_data.add_data(helper.process_accelerometer_data(data))
-    helper.save_calibration_data(output, calibration_data)
+    helper.save_calibration_data(output, max_freq, calibration_data)
 
 def write_specgram(psd, freq_bins, time, output):
     M = freq_bins.shape[0]
@@ -230,7 +230,7 @@ def main():
             pdata, bins, t = calc_specgram(datas[0], options.axis)
             write_specgram(pdata, bins, t, options.output)
         else:
-            write_frequency_response(datas, options.output)
+            write_frequency_response(datas, options.max_freq, options.output)
         return
 
     # Draw graph

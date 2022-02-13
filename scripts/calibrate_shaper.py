@@ -40,7 +40,7 @@ def parse_log(logname):
 ######################################################################
 
 # Find the best shaper parameters
-def calibrate_shaper(datas, csv_output, max_smoothing):
+def calibrate_shaper(datas, csv_output, max_freq, max_smoothing):
     helper = shaper_calibrate.ShaperCalibrate(printer=None)
     if isinstance(datas[0], shaper_calibrate.CalibrationData):
         calibration_data = datas[0]
@@ -53,11 +53,11 @@ def calibrate_shaper(datas, csv_output, max_smoothing):
             calibration_data.add_data(helper.process_accelerometer_data(data))
         calibration_data.normalize_to_frequencies()
     shaper, all_shapers = helper.find_best_shaper(
-            calibration_data, max_smoothing, print)
+            calibration_data, max_freq, max_smoothing, print)
     print("Recommended shaper is %s @ %.1f Hz" % (shaper.name, shaper.freq))
     if csv_output is not None:
         helper.save_calibration_data(
-                csv_output, calibration_data, all_shapers)
+                csv_output, max_freq, calibration_data, all_shapers)
     return shaper.name, all_shapers, calibration_data
 
 ######################################################################
@@ -154,7 +154,7 @@ def main():
 
     # Calibrate shaper and generate outputs
     selected_shaper, shapers, calibration_data = calibrate_shaper(
-            datas, options.csv, options.max_smoothing)
+            datas, options.csv, options.max_freq, options.max_smoothing)
 
     if not options.csv or options.output:
         # Draw graph
