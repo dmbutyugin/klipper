@@ -6,6 +6,8 @@
 import stepper, chelper
 from . import force_move
 
+FLUSH_DELAY = 0.001
+
 class ManualStepper:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -34,6 +36,10 @@ class ManualStepper:
         gcode.register_mux_command('MANUAL_STEPPER', "STEPPER",
                                    stepper_name, self.cmd_MANUAL_STEPPER,
                                    desc=self.cmd_MANUAL_STEPPER_help)
+        self.printer.register_event_handler("klippy:connect", self.connect)
+    def connect(self):
+        toolhead = self.printer.lookup_object('toolhead')
+        toolhead.register_step_generator(self.rail.generate_steps)
     def sync_print_time(self):
         toolhead = self.printer.lookup_object('toolhead')
         print_time = toolhead.get_last_move_time()
@@ -57,6 +63,9 @@ class ManualStepper:
         self.rail.set_position([setpos, 0., 0.])
     def do_move(self, movepos, speed, accel, sync=True):
         self.sync_print_time()
+        toolhead = self.printer.lookup_object('toolhead')
+        finalize_time = self.next_cmd_time - FLUSH_DELAY
+        self.trapq_finalize_moves(self.trapq, finalize_time)
         cp = self.rail.get_commanded_position()
         dist = movepos - cp
         axis_r, accel_t, cruise_t, cruise_v = force_move.calc_move_time(
@@ -66,9 +75,6 @@ class ManualStepper:
                           cp, 0., 0., axis_r, 0., 0.,
                           0., cruise_v, accel)
         self.next_cmd_time = self.next_cmd_time + accel_t + cruise_t + accel_t
-        self.rail.generate_steps(self.next_cmd_time)
-        self.trapq_finalize_moves(self.trapq, self.next_cmd_time + 99999.9)
-        toolhead = self.printer.lookup_object('toolhead')
         toolhead.note_kinematic_activity(self.next_cmd_time)
         if sync:
             self.sync_print_time()

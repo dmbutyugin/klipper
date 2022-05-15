@@ -331,7 +331,7 @@ class ToolHead:
         if self.special_queuing_state:
             self._update_drip_move_time(next_move_time)
         self._update_move_time(next_move_time)
-        self.last_kin_move_time = next_move_time
+        self.last_kin_move_time = max(next_move_time, self.last_kin_move_time)
     def flush_step_generation(self):
         # Transition from "Flushed"/"Priming"/main state to "Flushed" state
         self.move_queue.flush()
@@ -340,10 +340,12 @@ class ToolHead:
         self.reactor.update_timer(self.flush_timer, self.reactor.NEVER)
         self.move_queue.set_flush_time(self.buffer_time_high)
         self.idle_flush_print_time = 0.
-        flush_time = self.last_kin_move_time + self.kin_flush_delay
-        flush_time = max(flush_time, self.print_time - self.kin_flush_delay)
-        self.last_kin_flush_time = max(self.last_kin_flush_time, flush_time)
-        self._update_move_time(max(self.print_time, self.last_kin_flush_time))
+        flush_time = max(self.print_time,
+                         self.last_kin_flush_time,
+                         self.last_kin_move_time + self.kin_flush_delay)
+        self._update_move_time(flush_time)
+        self.last_kin_flush_time = max(self.last_kin_flush_time,
+                                       flush_time - self.kin_flush_delay)
     def _flush_lookahead(self):
         if self.special_queuing_state:
             return self.flush_step_generation()
