@@ -52,6 +52,8 @@ struct step_move {
     uint32_t interval;
     uint16_t count;
     int16_t add;
+    int16_t add2;
+    int8_t shift;
 };
 
 #define HISTORY_EXPIRE (30.0)
@@ -60,7 +62,7 @@ struct history_steps {
     struct list_node node;
     uint64_t first_clock, last_clock;
     int64_t start_position;
-    int step_count, interval, add;
+    int step_count, interval, add, add2, shift;
 };
 
 
@@ -126,7 +128,7 @@ compress_bisect_add(struct stepcompress *sc)
             nextcount++;
             if (&sc->queue_pos[nextcount-1] >= qlast) {
                 int32_t count = nextcount - 1;
-                return (struct step_move){ interval, count, add };
+                return (struct step_move){ interval, count, add, 0, 0};
             }
             nextpoint = minmax_point(sc, sc->queue_pos + nextcount - 1);
             int32_t nextaddfactor = nextcount*(nextcount-1)/2;
@@ -194,8 +196,8 @@ compress_bisect_add(struct stepcompress *sc)
     }
     if (zerocount + zerocount/16 >= bestcount)
         // Prefer add=0 if it's similar to the best found sequence
-        return (struct step_move){ zerointerval, zerocount, 0 };
-    return (struct step_move){ bestinterval, bestcount, bestadd };
+        return (struct step_move){ zerointerval, zerocount, 0, 0, 0 };
+    return (struct step_move){ bestinterval, bestcount, bestadd, 0, 0 };
 }
 
 
@@ -349,10 +351,11 @@ add_move(struct stepcompress *sc, uint64_t first_clock, struct step_move *move)
     uint64_t last_clock = first_clock + ticks;
 
     // Create and queue a queue_step command
-    uint32_t msg[5] = {
-        sc->queue_step_msgtag, sc->oid, move->interval, move->count, move->add
+    uint32_t msg[7] = {
+        sc->queue_step_msgtag, sc->oid, move->interval, move->count,
+        move->add, move->add2, move->shift
     };
-    struct queue_message *qm = message_alloc_and_encode(msg, 5);
+    struct queue_message *qm = message_alloc_and_encode(msg, 7);
     qm->min_clock = qm->req_clock = sc->last_step_clock;
     if (move->count == 1 && first_clock >= sc->last_step_clock + CLOCK_DIFF_MAX)
         qm->req_clock = first_clock;
@@ -366,6 +369,8 @@ add_move(struct stepcompress *sc, uint64_t first_clock, struct step_move *move)
     hs->start_position = sc->last_position;
     hs->interval = move->interval;
     hs->add = move->add;
+    hs->add2 = move->add2;
+    hs->shift = move->shift;
     hs->step_count = sc->sdir ? move->count : -move->count;
     sc->last_position += hs->step_count;
     list_add_head(&hs->node, &sc->history_list);
@@ -399,7 +404,7 @@ queue_flush(struct stepcompress *sc, uint64_t move_clock)
 static int
 stepcompress_flush_far(struct stepcompress *sc, uint64_t abs_step_clock)
 {
-    struct step_move move = { abs_step_clock - sc->last_step_clock, 1, 0 };
+    struct step_move move = { abs_step_clock - sc->last_step_clock, 1, 0, 0, 0 };
     add_move(sc, abs_step_clock, &move);
     calc_last_step_print_time(sc);
     return 0;
