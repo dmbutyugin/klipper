@@ -90,7 +90,8 @@ class MCU_stepper:
         self._mcu.add_config_cmd("reset_step_clock oid=%d clock=0"
                                  % (self._oid,), on_restart=True)
         step_cmd_tag = self._mcu.lookup_command_tag(
-            "queue_step oid=%c interval=%u count=%hu add=%hi")
+            "queue_step oid=%c interval=%u count=%hu add=%hi "
+            "add2=%hi shift=%hi")
         dir_cmd_tag = self._mcu.lookup_command_tag(
             "set_next_step_dir oid=%c dir=%c")
         self._reset_cmd_tag = self._mcu.lookup_command_tag(
