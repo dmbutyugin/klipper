@@ -28,6 +28,19 @@
 #define CHECK_LINES 1
 #define QUEUE_START_SIZE 1024
 
+// Maximum error between compressed and actual step,
+// in the form of (step_i - step_{i-1}) >> MAX_ERR_2P
+#define MAX_ERR_2P 6
+// Limits on step_move values
+#define MAX_COUNT 256
+// Limits below are optimized for "message blocks" encoding
+// and underlying storage types and MCU-side implementation
+#define MAX_INTRVL 0x3FFFFFF
+#define MAX_ADD 0x7FFF
+#define MAX_ADD2 0xFFF
+#define MAX_SHIFT 16
+#define MIN_SHIFT -8
+
 struct stepcompress {
     // Buffer management
     uint32_t *queue, *queue_end, *queue_pos, *queue_next;
@@ -54,6 +67,7 @@ struct step_move {
     int16_t add;
     int16_t add2;
     int8_t shift;
+    uint64_t first_step, last_step;
 };
 
 #define HISTORY_EXPIRE (30.0)
@@ -70,16 +84,146 @@ struct history_steps {
  * Step compression
  ****************************************************************/
 
-static inline int32_t
-idiv_up(int32_t n, int32_t d)
+struct matrix_3x3 {
+    double a00, a10, a11, a20, a21, a22;
+};
+
+struct rhs_3 {
+    double b0, b1, b2;
+};
+
+struct matrix_3x3 least_squares_ldl[MAX_COUNT] = {0};
+
+static void
+fill_least_squares_matrix_3x3(uint16_t count, struct matrix_3x3 *m)
 {
-    return (n>=0) ? DIV_ROUND_UP(n,d) : (n/d);
+    int32_t i;
+    memset(m, 0, sizeof(*m));
+    for (i = 0; i < count; ++i) {
+        int32_t c0 = i+1;
+        int32_t c1 = c0 * i / 2;
+        int32_t c2 = c1 * (i-1) / 3;
+
+        m->a00 += (double)c0 * c0;
+        m->a10 += (double)c1 * c0;
+        m->a11 += (double)c1 * c1;
+        m->a20 += (double)c2 * c0;
+        m->a21 += (double)c2 * c1;
+        m->a22 += (double)c2 * c2;
+    }
+    if (i < 2) m->a11 = 1.;
+    if (i < 3) m->a22 = 1.;
 }
 
-static inline int32_t
-idiv_down(int32_t n, int32_t d)
+static void
+compute_ldl_3x3(struct matrix_3x3 *m)
 {
-    return (n>=0) ? (n/d) : (n - d + 1) / d;
+    double d0 = m->a00;
+    m->a00 = 1. / d0;
+    m->a10 *= m->a00;
+    m->a20 *= m->a00;
+
+    double d1 = m->a11 - d0 * m->a10 * m->a10;
+    m->a11 = 1. / d1;
+    m->a21 -= m->a20 * m->a10 * d0;
+    m->a21 *= m->a11;
+
+    double d2 = m->a22 - d0 * m->a20 * m->a20 - d1 * m->a21 * m->a21;
+    m->a22 = 1. / d2;
+}
+
+static void
+compute_rhs_3(struct stepcompress *sc, uint16_t count, struct rhs_3 *f)
+{
+    memset(f, 0, sizeof(*f));
+    uint32_t lsc = sc->last_step_clock;
+    for (uint16_t i = 0; i < count; ++i) {
+        double d = sc->queue_pos[i] - lsc;
+        int32_t c = i+1;
+        f->b0 += d * c;
+        c = c * i / 2;
+        f->b1 += d * c;
+        c = c * (i-1) / 3;
+        f->b2 += d * c;
+    }
+}
+
+static void
+solve_3x3(struct matrix_3x3 *m, struct rhs_3 *f)
+{
+    f->b1 -= f->b0 * m->a10;
+    f->b2 -= f->b0 * m->a20 + f->b1 * m->a21;
+
+    f->b0 *= m->a00;
+    f->b1 *= m->a11;
+    f->b2 *= m->a22;
+
+    f->b1 -= f->b2 * m->a21;
+    f->b0 -= f->b1 * m->a10 + f->b2 * m->a20;
+}
+
+static struct matrix_3x3*
+get_least_squares_ldl_3x3(uint16_t count)
+{
+    if (count > MAX_COUNT) return NULL;
+    struct matrix_3x3 *m = &least_squares_ldl[count-1];
+    if (!m->a00) {
+        fill_least_squares_matrix_3x3(count, m);
+        compute_ldl_3x3(m);
+    }
+    return m;
+}
+
+static struct step_move
+step_move_encode(uint16_t count, struct rhs_3* f)
+{
+    struct step_move res;
+    memset(&res, 0, sizeof(res));
+    double interval = f->b0, add = f->b1, add2 = f->b2;
+    if (interval < 0.)
+        return res;
+    if (count <= 1) {
+        res.count = count;
+        res.interval = round(interval);
+        return res;
+    }
+    double end_add = add + add2 * count;
+    double max_int_inc = count * (fabs(add) > fabs(end_add) ?
+                                  fabs(add) : fabs(end_add));
+    double max_end_int = interval + max_int_inc;
+    if (fabs(add) > MAX_ADD || fabs(end_add) > MAX_ADD ||
+            fabs(add2) > MAX_ADD2 || max_end_int > MAX_INTRVL) {
+        while (res.shift >= MIN_SHIFT && (
+                    fabs(add) > MAX_ADD || fabs(end_add) > MAX_ADD ||
+                    fabs(add2) > MAX_ADD2 || max_end_int > MAX_INTRVL)) {
+            interval *= 0.5;
+            add *= 0.5;
+            add2 *= 0.5;
+            end_add *= 0.5;
+            max_end_int *= 0.5;
+            --res.shift;
+        }
+        if (res.shift < MIN_SHIFT)
+            // Cannot encode the current rhs_3, the values are too large
+            return res;
+    } else if (max_int_inc >= 0.5 ||
+               count * fabs(interval-round(interval)) >= 0.5) {
+        while (res.shift < MAX_SHIFT &&
+                fabs(add * 2.) <= MAX_ADD && fabs(end_add * 2.) <= MAX_ADD &&
+                fabs(add2 * 2.) <= MAX_ADD2 && max_end_int * 2. <= MAX_INTRVL) {
+            interval *= 2.;
+            add *= 2.;
+            add2 *= 2.;
+            end_add *= 2.;
+            max_end_int *= 2.;
+            ++res.shift;
+        }
+    }
+    res.count = count;
+    res.interval = round(interval);
+    res.add = round(add);
+    res.add2 = round(add2);
+    return res;
 }
 
 struct points {
@@ -93,111 +237,173 @@ minmax_point(struct stepcompress *sc, uint32_t *pos)
 {
     uint32_t lsc = sc->last_step_clock, point = *pos - lsc;
     uint32_t prevpoint = pos > sc->queue_pos ? *(pos-1) - lsc : 0;
-    uint32_t max_error = (point - prevpoint) / 2;
-    if (max_error > sc->max_error)
-        max_error = sc->max_error;
-    return (struct points){ point - max_error, point };
+    uint32_t nextpoint = pos + 1 < sc->queue_next ? *(pos+1) - lsc : point;
+    uint32_t max_bck_error = (point - prevpoint) >> MAX_ERR_2P;
+    uint32_t max_frw_error = (nextpoint - point) >> MAX_ERR_2P;
+    if (max_bck_error > sc->max_error)
+        max_bck_error = sc->max_error;
+    if (max_frw_error > sc->max_error)
+        max_frw_error = sc->max_error;
+    return (struct points){ point - max_bck_error, point + max_frw_error };
 }
 
-// The maximum add delta between two valid quadratic sequences of the
-// form "add*count*(count-1)/2 + interval*count" is "(6 + 4*sqrt(2)) *
-// maxerror / (count*count)".  The "6 + 4*sqrt(2)" is 11.65685, but
-// using 11 works well in practice.
-#define QUADRATIC_DEV 11
+struct stepper_moves {
+    uint32_t interval;
+    uint16_t int_low;
+    int32_t int_low_acc;
+    int32_t add;
+    int32_t add2;
+    uint32_t count;
+};
+
+static inline void
+add_interval(uint32_t* time, struct stepper_moves *s)
+{
+    uint32_t next_time = *time + s->interval;
+    if (likely(s->int_low)) {
+        int32_t int_low_acc = s->int_low_acc + s->int_low;
+        if (unlikely(int_low_acc >= 0 && ((int_low_acc & 0x00008000) ||
+                                          ((int_low_acc >> 16) & 0xff)))) {
+            ++next_time;
+            int_low_acc -= 0x10000;
+        }
+        s->int_low_acc = int_low_acc;
+    }
+    *time = next_time;
+}
+
+static inline void
+inc_interval(struct stepper_moves *s)
+{
+    uint32_t int_add = (uint32_t)(s->int_low + s->add);
+    s->int_low = int_add & 0xffff;
+    uint16_t int_add_high = int_add >> 16;
+    if (!(int_add_high & 0x8000))
+        s->interval += int_add_high;
+    else
+        s->interval -= (uint16_t)~int_add_high + 1;
+    s->add += s->add2;
+}
+
+static void
+fill_stepper_moves(struct step_move *m, struct stepper_moves *s)
+{
+    s->count = m->count;
+    uint32_t interval = m->interval;
+    int16_t add = m->add;
+    int16_t add2 = m->add2;
+    int8_t shift = m->shift;
+
+    if (shift > 0) {
+        s->interval = interval >> shift;
+        s->int_low = (interval << (16 - shift)) & 0xFFFF;
+    } else {
+        s->interval = interval << -shift;
+        s->int_low = 0;
+    }
+    // Left shift of the signed int is undefined behavior,
+    // use addition instead.
+    int32_t add_shifted = add, add2_shifted = add2;
+    for (uint_fast8_t i = 16 - shift; i > 0; --i) {
+        add_shifted += add_shifted;
+        add2_shifted += add2_shifted;
+    }
+    s->add = add_shifted;
+    s->add2 = add2_shifted;
+    s->int_low_acc = 0;
+}
+
+static int
+test_step_move(struct stepcompress *sc, struct step_move *m, int report_errors)
+{
+    if (!m->count || (!m->interval && !m->add && !m->add2 && m->count > 1)
+        || m->interval >= 0x80000000
+        || m->add < -MAX_ADD || m->add > MAX_ADD
+        || m->add2 < -MAX_ADD2 || m->add2 > MAX_ADD2
+        || m->shift > MAX_SHIFT || m->shift < MIN_SHIFT) {
+        if (report_errors)
+            errorf("stepcompress o=%d i=%d c=%d a=%d, a2=%d, s=%d:"
+                   " Invalid sequence"
+                   , sc->oid, m->interval, m->count, m->add, m->add2, m->shift);
+        m->count = 0;
+        return ERROR_RET;
+    }
+    struct stepper_moves s;
+    fill_stepper_moves(m, &s);
+    uint16_t i;
+    uint32_t cur_step = 0;
+    for (i = 0; i < m->count; ++i) {
+        add_interval(&cur_step, &s);
+        struct points point = minmax_point(sc, sc->queue_pos + i);
+        if (cur_step < point.minp || cur_step > point.maxp) {
+            if (report_errors)
+                errorf("stepcompress o=%d i=%d c=%d a=%d, a2=%d, s=%d:"
+                       " Point %u: %d not in %d:%d"
+                       , sc->oid, m->interval, m->count, m->add, m->add2
+                       , m->shift, i+1, cur_step, point.minp, point.maxp);
+            // The least squares method does not minimize the maximum error
+            // in the generated step sequence, but rather the total error.
+            // However, we can still use the longest good generated prefix.
+            m->count = i;
+            return ERROR_RET;
+        }
+        inc_interval(&s);
+        if (s.interval >= 0x80000000) {
+            if (report_errors)
+                errorf("stepcompress o=%d i=%d c=%d a=%d, a2=%d, s=%d:"
+                       " Point %d: interval overflow %d"
+                       , sc->oid, m->interval, m->count, m->add, m->add2
+                       , m->shift, i+1, s.interval);
+            m->count = i;
+            return ERROR_RET;
+        }
+        m->last_step = cur_step;
+        if (!m->first_step)
+            m->first_step = cur_step;
+    }
+    return 0;
+}
+
+static struct step_move
+test_step_count(struct stepcompress *sc, uint16_t count)
+{
+    struct matrix_3x3 *m = get_least_squares_ldl_3x3(count);
+    struct rhs_3 f;
+    compute_rhs_3(sc, count, &f);
+    solve_3x3(m, &f);
+    struct step_move res = step_move_encode(count, &f);
+    test_step_move(sc, &res, /*report_errors=*/0);
+    return res;
+}
 
 // Find a 'step_move' that covers a series of step times
 static struct step_move
-compress_bisect_add(struct stepcompress *sc)
+compress_bisect_count(struct stepcompress *sc)
 {
-    uint32_t *qlast = sc->queue_next;
-    if (qlast > sc->queue_pos + 65535)
-        qlast = sc->queue_pos + 65535;
-    struct points point = minmax_point(sc, sc->queue_pos);
-    int32_t outer_mininterval = point.minp, outer_maxinterval = point.maxp;
-    int32_t add = 0, minadd = -0x8000, maxadd = 0x7fff;
-    int32_t bestinterval = 0, bestcount = 1, bestadd = 1, bestreach = INT32_MIN;
-    int32_t zerointerval = 0, zerocount = 0;
-
-    for (;;) {
-        // Find longest valid sequence with the given 'add'
-        struct points nextpoint;
-        int32_t nextmininterval = outer_mininterval;
-        int32_t nextmaxinterval = outer_maxinterval, interval = nextmaxinterval;
-        int32_t nextcount = 1;
-        for (;;) {
-            nextcount++;
-            if (&sc->queue_pos[nextcount-1] >= qlast) {
-                int32_t count = nextcount - 1;
-                return (struct step_move){ interval, count, add, 0, 0};
-            }
-            nextpoint = minmax_point(sc, sc->queue_pos + nextcount - 1);
-            int32_t nextaddfactor = nextcount*(nextcount-1)/2;
-            int32_t c = add*nextaddfactor;
-            if (nextmininterval*nextcount < nextpoint.minp - c)
-                nextmininterval = idiv_up(nextpoint.minp - c, nextcount);
-            if (nextmaxinterval*nextcount > nextpoint.maxp - c)
-                nextmaxinterval = idiv_down(nextpoint.maxp - c, nextcount);
-            if (nextmininterval > nextmaxinterval)
-                break;
-            interval = nextmaxinterval;
+    uint16_t left = 0, right = 8;
+    struct step_move cur, best;
+    best.count = 0;
+    for (; right <= MAX_COUNT; right <<= 1) {
+        cur = test_step_count(sc, right);
+        if (cur.count > left) {
+            best = cur;
+            left = cur.count;
         }
-
-        // Check if this is the best sequence found so far
-        int32_t count = nextcount - 1, addfactor = count*(count-1)/2;
-        int32_t reach = add*addfactor + interval*count;
-        if (reach > bestreach
-            || (reach == bestreach && interval > bestinterval)) {
-            bestinterval = interval;
-            bestcount = count;
-            bestadd = add;
-            bestreach = reach;
-            if (!add) {
-                zerointerval = interval;
-                zerocount = count;
-            }
-            if (count > 0x200)
-                // No 'add' will improve sequence; avoid integer overflow
-                break;
-        }
-
-        // Check if a greater or lesser add could extend the sequence
-        int32_t nextaddfactor = nextcount*(nextcount-1)/2;
-        int32_t nextreach = add*nextaddfactor + interval*nextcount;
-        if (nextreach < nextpoint.minp) {
-            minadd = add + 1;
-            outer_maxinterval = nextmaxinterval;
-        } else {
-            maxadd = add - 1;
-            outer_mininterval = nextmininterval;
-        }
-
-        // The maximum valid deviation between two quadratic sequences
-        // can be calculated and used to further limit the add range.
-        if (count > 1) {
-            int32_t errdelta = sc->max_error*QUADRATIC_DEV / (count*count);
-            if (minadd < add - errdelta)
-                minadd = add - errdelta;
-            if (maxadd > add + errdelta)
-                maxadd = add + errdelta;
-        }
-
-        // See if next point would further limit the add range
-        int32_t c = outer_maxinterval * nextcount;
-        if (minadd*nextaddfactor < nextpoint.minp - c)
-            minadd = idiv_up(nextpoint.minp - c, nextaddfactor);
-        c = outer_mininterval * nextcount;
-        if (maxadd*nextaddfactor > nextpoint.maxp - c)
-            maxadd = idiv_down(nextpoint.maxp - c, nextaddfactor);
-
-        // Bisect valid add range and try again with new 'add'
-        if (minadd > maxadd)
-            break;
-        add = maxadd - (maxadd - minadd) / 4;
+        else break;
     }
-    if (zerocount + zerocount/16 >= bestcount)
-        // Prefer add=0 if it's similar to the best found sequence
-        return (struct step_move){ zerointerval, zerocount, 0, 0, 0 };
-    return (struct step_move){ bestinterval, bestcount, bestadd, 0, 0 };
+    if (right > MAX_COUNT) right = MAX_COUNT + 1;
+    while (right - left > 1) {
+        uint16_t count = (left + right) / 2;
+        cur = test_step_count(sc, count);
+        if (cur.count > best.count) best = cur;
+        if (cur.count < count) right = count;
+        if (cur.count > left) left = count;
+    }
+    if (best.count <= 1) {
+        uint32_t interval = *sc->queue_pos - (uint32_t)sc->last_step_clock;
+        return (struct step_move){ interval, 1, 0, 0, 0, interval, interval };
+    }
+    return best;
 }
 
 
@@ -206,38 +412,12 @@ compress_bisect_add(struct stepcompress *sc)
  ****************************************************************/
 
 // Verify that a given 'step_move' matches the actual step times
-static int
+static inline int
 check_line(struct stepcompress *sc, struct step_move move)
 {
     if (!CHECK_LINES)
         return 0;
-    if (!move.count || (!move.interval && !move.add && move.count > 1)
-        || move.interval >= 0x80000000) {
-        errorf("stepcompress o=%d i=%d c=%d a=%d: Invalid sequence"
-               , sc->oid, move.interval, move.count, move.add);
-        return ERROR_RET;
-    }
-    uint32_t interval = move.interval, p = 0;
-    uint16_t i;
-    for (i=0; i<move.count; i++) {
-        struct points point = minmax_point(sc, sc->queue_pos + i);
-        p += interval;
-        if (p < point.minp || p > point.maxp) {
-            errorf("stepcompress o=%d i=%d c=%d a=%d: Point %d: %d not in %d:%d"
-                   , sc->oid, move.interval, move.count, move.add
-                   , i+1, p, point.minp, point.maxp);
-            return ERROR_RET;
-        }
-        if (interval >= 0x80000000) {
-            errorf("stepcompress o=%d i=%d c=%d a=%d:"
-                   " Point %d: interval overflow %d"
-                   , sc->oid, move.interval, move.count, move.add
-                   , i+1, interval);
-            return ERROR_RET;
-        }
-        interval += move.add;
-    }
-    return 0;
+    return test_step_move(sc, &move, /*report_errors=*/1);
 }
 
 
@@ -346,9 +526,7 @@ stepcompress_set_time(struct stepcompress *sc
 static void
 add_move(struct stepcompress *sc, uint64_t first_clock, struct step_move *move)
 {
-    int32_t addfactor = move->count*(move->count-1)/2;
-    uint32_t ticks = move->add*addfactor + move->interval*(move->count-1);
-    uint64_t last_clock = first_clock + ticks;
+    uint64_t last_clock = sc->last_step_clock + move->last_step;
 
     // Create and queue a queue_step command
     uint32_t msg[7] = {
@@ -383,12 +561,12 @@ queue_flush(struct stepcompress *sc, uint64_t move_clock)
     if (sc->queue_pos >= sc->queue_next)
         return 0;
     while (sc->last_step_clock < move_clock) {
-        struct step_move move = compress_bisect_add(sc);
+        struct step_move move = compress_bisect_count(sc);
         int ret = check_line(sc, move);
         if (ret)
             return ret;
 
-        add_move(sc, sc->last_step_clock + move.interval, &move);
+        add_move(sc, sc->last_step_clock + move.first_step, &move);
 
         if (sc->queue_pos + move.count >= sc->queue_next) {
             sc->queue_pos = sc->queue_next = sc->queue;
@@ -404,7 +582,8 @@ queue_flush(struct stepcompress *sc, uint64_t move_clock)
 static int
 stepcompress_flush_far(struct stepcompress *sc, uint64_t abs_step_clock)
 {
-    struct step_move move = { abs_step_clock - sc->last_step_clock, 1, 0, 0, 0 };
+    uint64_t interval = abs_step_clock - sc->last_step_clock;
+    struct step_move move = { interval, 1, 0, 0, 0, interval, interval };
     add_move(sc, abs_step_clock, &move);
     calc_last_step_print_time(sc);
     return 0;
@@ -598,15 +777,33 @@ stepcompress_find_past_position(struct stepcompress *sc, uint64_t clock)
         }
         if (clock >= hs->last_clock)
             return hs->start_position + hs->step_count;
-        int32_t interval = hs->interval, add = hs->add;
-        int32_t ticks = (int32_t)(clock - hs->first_clock) + interval, offset;
-        if (!add) {
-            offset = ticks / interval;
+        int64_t ticks = clock - hs->first_clock;
+        int64_t interval = hs->interval, add = hs->add, add2 = hs->add2;
+        int count = hs->step_count, shift = hs->shift;
+        if (count < 0) count = -count;
+        if (shift <= 0) {
+            int mul = 1 << -shift;
+            interval <<= -shift;
+            add *= mul;
+            add2 *= mul;
         } else {
-            // Solve for "count" using quadratic formula
-            double a = .5 * add, b = interval - .5 * add, c = -ticks;
-            offset = (sqrt(b*b - 4*a*c) - b) / (2. * a);
+            ticks *= 1 << shift;
         }
+        // When clock == hs->first_clock, offset == 1
+        ticks += interval;
+        int left = 0, right = count;
+        while (right - left > 1) {
+            int cnt = (left + right) / 2;
+            int64_t step_clock = cnt * interval + cnt * (cnt-1) / 2 * add +
+                cnt * (cnt-1) * (cnt-2) / 6 * add2;
+            if (step_clock <= ticks) left = cnt;
+            else right = cnt;
+        }
+        int64_t clock_left = left * interval + left * (left-1) / 2 * add +
+            left * (left-1) * (left-2) / 6 * add2;
+        int64_t clock_right = right * interval + right * (right-1) / 2 * add +
+            right * (right-1) * (right-2) / 6 * add2;
+        int offset = ticks - clock_left <= clock_right - ticks ? left : right;
         if (hs->step_count < 0)
             return hs->start_position - offset;
         return hs->start_position + offset;
