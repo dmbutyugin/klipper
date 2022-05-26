@@ -843,6 +843,8 @@ stepcompress_extract_old(struct stepcompress *sc, struct pull_history_steps *p
         p->step_count = hs->step_count;
         p->interval = hs->interval;
         p->add = hs->add;
+        p->add2 = hs->add2;
+        p->shift = hs->shift;
         p++;
         res++;
     }
