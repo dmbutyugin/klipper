@@ -59,6 +59,7 @@ struct stepcompress {
     // History tracking
     int64_t last_position;
     struct list_head history_list;
+    struct rhs_3 *rhs_cache;
 };
 
 struct step_move {
@@ -142,20 +143,23 @@ compute_ldl_3x3(struct matrix_3x3 *m)
 }
 
 static void
-compute_rhs_3(struct stepcompress *sc, uint16_t count, struct rhs_3 *f)
+compute_rhs_3(struct stepcompress *sc, uint16_t count, struct rhs_3 *f
+              , struct rhs_3 *prev_f)
 {
-    memset(f, 0, sizeof(*f));
     uint32_t lsc = sc->last_step_clock;
-    f->b0 += FIRST_STEP_BIAS * (*sc->queue_pos - lsc);
-    for (uint16_t i = 0; i < count; ++i) {
-        double d = sc->queue_pos[i] - lsc;
-        int32_t c = i+1;
-        f->b0 += d * c;
-        c = c * i / 2;
-        f->b1 += d * c;
-        c = c * (i-1) / 3;
-        f->b2 += d * c;
+    if (unlikely(count <= 1)) {
+        memset(f, 0, sizeof(*f));
+        f->b0 += FIRST_STEP_BIAS * (*sc->queue_pos - lsc);
+    } else {
+        *f = *prev_f;
     }
+    double d = sc->queue_pos[count-1] - lsc;
+    int32_t c = count;
+    f->b0 += d * c;
+    c = c * (count-1) / 2;
+    f->b1 += d * c;
+    c = c * (count-2) / 3;
+    f->b2 += d * c;
 }
 
 static void
@@ -378,8 +382,7 @@ static struct step_move
 test_step_count(struct stepcompress *sc, uint16_t count)
 {
     struct matrix_3x3 *m = get_least_squares_ldl_3x3(count);
-    struct rhs_3 f;
-    compute_rhs_3(sc, count, &f);
+    struct rhs_3 f = sc->rhs_cache[count-1];
     solve_3x3(m, &f);
     struct step_move res = step_move_encode(count, &f);
     test_step_move(sc, &res, /*report_errors=*/0);
@@ -390,10 +393,13 @@ test_step_count(struct stepcompress *sc, uint16_t count)
 static struct step_move
 compress_bisect_count(struct stepcompress *sc)
 {
-    uint16_t left = 0, right = 8;
     struct step_move cur, best;
     best.count = 0;
+    compute_rhs_3(sc, /*count=*/1, &sc->rhs_cache[0], NULL);
+    uint16_t i = 2, left = 0, right = 8;
     for (; right <= MAX_COUNT; right <<= 1) {
+        for (; i <= right; ++i)
+            compute_rhs_3(sc, i, &sc->rhs_cache[i-1], &sc->rhs_cache[i-2]);
         cur = test_step_count(sc, right);
         if (cur.count > left) {
             best = cur;
@@ -402,6 +408,8 @@ compress_bisect_count(struct stepcompress *sc)
         else break;
     }
     if (right > MAX_COUNT) right = MAX_COUNT + 1;
+    for (; i < right; ++i)
+        compute_rhs_3(sc, i, &sc->rhs_cache[i-1], &sc->rhs_cache[i-2]);
     while (right - left > 1) {
         uint16_t count = (left + right) / 2;
         cur = test_step_count(sc, count);
@@ -445,6 +453,7 @@ stepcompress_alloc(uint32_t oid)
     list_init(&sc->history_list);
     sc->oid = oid;
     sc->sdir = -1;
+    sc->rhs_cache = malloc(sizeof(sc->rhs_cache[0]) * MAX_COUNT);
     return sc;
 }
 
@@ -490,6 +499,7 @@ stepcompress_free(struct stepcompress *sc)
 {
     if (!sc)
         return;
+    free(sc->rhs_cache);
     free(sc->queue);
     message_queue_free(&sc->msg_queue);
     free_history(sc, UINT64_MAX);
