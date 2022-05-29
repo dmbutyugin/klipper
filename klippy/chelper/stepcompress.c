@@ -84,6 +84,14 @@ struct history_steps {
  * Step compression
  ****************************************************************/
 
+// A bias of the first step in the generated step sequence step_move towards
+// the first requires step in the least squares method. The zero value means
+// no bias: the first step error is minimized as all other step errors, and
+// values larger than zero make the method reduce the first step error more
+// than other step errors. This helps pushing back the maximum errors towards
+// the end of the generated step sequence.
+#define FIRST_STEP_BIAS 1.0
+
 struct matrix_3x3 {
     double a00, a10, a11, a20, a21, a22;
 };
@@ -111,6 +119,7 @@ fill_least_squares_matrix_3x3(uint16_t count, struct matrix_3x3 *m)
         m->a21 += (double)c2 * c1;
         m->a22 += (double)c2 * c2;
     }
+    m->a00 += FIRST_STEP_BIAS;
     if (i < 2) m->a11 = 1.;
     if (i < 3) m->a22 = 1.;
 }
@@ -137,6 +146,7 @@ compute_rhs_3(struct stepcompress *sc, uint16_t count, struct rhs_3 *f)
 {
     memset(f, 0, sizeof(*f));
     uint32_t lsc = sc->last_step_clock;
+    f->b0 += FIRST_STEP_BIAS * (*sc->queue_pos - lsc);
     for (uint16_t i = 0; i < count; ++i) {
         double d = sc->queue_pos[i] - lsc;
         int32_t c = i+1;
