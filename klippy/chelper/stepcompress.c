@@ -31,8 +31,9 @@
 // Maximum error between compressed and actual step,
 // in the form of (step_i - step_{i-1}) >> MAX_ERR_2P
 #define MAX_ERR_2P 6
-// Limits on step_move values
-#define MAX_COUNT 256
+// Limits on step_move values for the least squares method
+#define MAX_COUNT_LSM 1024
+#define MAX_COUNT_BISECT 256
 // Limits below are optimized for "message blocks" encoding
 // and underlying storage types and MCU-side implementation
 #define MAX_INTRVL 0x3FFFFFF
@@ -101,7 +102,7 @@ struct rhs_3 {
     double b0, b1, b2;
 };
 
-struct matrix_3x3 least_squares_ldl[MAX_COUNT] = {0};
+struct matrix_3x3 least_squares_ldl[MAX_COUNT_LSM] = {0};
 
 static void
 fill_least_squares_matrix_3x3(uint16_t count, struct matrix_3x3 *m)
@@ -179,7 +180,7 @@ solve_3x3(struct matrix_3x3 *m, struct rhs_3 *f)
 static struct matrix_3x3*
 get_least_squares_ldl_3x3(uint16_t count)
 {
-    if (count > MAX_COUNT) return NULL;
+    if (count > MAX_COUNT_LSM) return NULL;
     struct matrix_3x3 *m = &least_squares_ldl[count-1];
     if (!m->a00) {
         fill_least_squares_matrix_3x3(count, m);
@@ -389,6 +390,17 @@ test_step_count(struct stepcompress *sc, uint16_t count)
     return res;
 }
 
+static struct step_move
+gen_avg_interval(struct stepcompress *sc, uint16_t count)
+{
+    uint32_t lsc = sc->last_step_clock;
+    double d = sc->queue_pos[count-1] - lsc;
+    struct rhs_3 f;
+    f.b0 = d / count;
+    f.b1 = f.b2 = 0.;
+    return step_move_encode(count, &f);
+}
+
 // Find a 'step_move' that covers a series of step times
 static struct step_move
 compress_bisect_count(struct stepcompress *sc)
@@ -396,8 +408,10 @@ compress_bisect_count(struct stepcompress *sc)
     struct step_move cur, best;
     best.count = 0;
     compute_rhs_3(sc, /*count=*/1, &sc->rhs_cache[0], NULL);
+    uint16_t queue_size = sc->queue_next < sc->queue_pos + 32767
+                        ? sc->queue_next - sc->queue_pos : 32767;
     uint16_t i = 2, left = 0, right = 8;
-    for (; right <= MAX_COUNT; right <<= 1) {
+    for (; right <= MAX_COUNT_LSM && right <= queue_size; right <<= 1) {
         for (; i <= right; ++i)
             compute_rhs_3(sc, i, &sc->rhs_cache[i-1], &sc->rhs_cache[i-2]);
         cur = test_step_count(sc, right);
@@ -407,7 +421,16 @@ compress_bisect_count(struct stepcompress *sc)
         }
         else break;
     }
-    if (right > MAX_COUNT) right = MAX_COUNT + 1;
+    if (best.count >= MAX_COUNT_BISECT) {
+        for (; right <= queue_size; right <<= 1) {
+            cur = gen_avg_interval(sc, right);
+            test_step_move(sc, &cur, /*report_errors=*/0);
+            if (cur.count > best.count) best = cur;
+            else break;
+        }
+        return best;
+    }
+    if (right > MAX_COUNT_LSM) right = MAX_COUNT_LSM + 1;
     for (; i < right; ++i)
         compute_rhs_3(sc, i, &sc->rhs_cache[i-1], &sc->rhs_cache[i-2]);
     while (right - left > 1) {
@@ -453,7 +476,7 @@ stepcompress_alloc(uint32_t oid)
     list_init(&sc->history_list);
     sc->oid = oid;
     sc->sdir = -1;
-    sc->rhs_cache = malloc(sizeof(sc->rhs_cache[0]) * MAX_COUNT);
+    sc->rhs_cache = malloc(sizeof(sc->rhs_cache[0]) * MAX_COUNT_LSM);
     return sc;
 }
 
