@@ -50,6 +50,7 @@ struct stepcompress {
     double mcu_time_offset, mcu_freq, last_step_print_time;
     // Message generation
     uint64_t last_step_clock;
+    uint32_t next_expected_interval;
     struct list_head msg_queue;
     uint32_t oid;
     int32_t queue_step_msgtag, set_next_step_dir_msgtag;
@@ -70,6 +71,7 @@ struct step_move {
     int16_t add2;
     int8_t shift;
     uint64_t first_step, last_step;
+    uint32_t last_step_interval;
 };
 
 #define HISTORY_EXPIRE (30.0)
@@ -87,11 +89,12 @@ struct history_steps {
  ****************************************************************/
 
 // A bias of the first step in the generated step sequence step_move towards
-// the first requires step in the least squares method. The zero value means
+// the first required step in the least squares method. The zero value means
 // no bias: the first step error is minimized as all other step errors, and
-// values larger than zero make the method reduce the first step error more
-// than other step errors. This helps pushing back the maximum errors towards
-// the end of the generated step sequence.
+// values larger than zero make the method push the first generated step
+// towards stepcompress.next_expected_interval. This helps reducing the jitter
+// between subsequent step_move(s) and pushing back the maximum errors towards
+// the end of the generated step_move sequence.
 #define FIRST_STEP_BIAS 1.0
 
 struct matrix_3x3 {
@@ -150,7 +153,7 @@ compute_rhs_3(struct stepcompress *sc, uint16_t count, struct rhs_3 *f
     uint32_t lsc = sc->last_step_clock;
     if (unlikely(count <= 1)) {
         memset(f, 0, sizeof(*f));
-        f->b0 += FIRST_STEP_BIAS * (*sc->queue_pos - lsc);
+        f->b0 += FIRST_STEP_BIAS * sc->next_expected_interval;
     } else {
         *f = *prev_f;
     }
@@ -346,7 +349,7 @@ test_step_move(struct stepcompress *sc, struct step_move *m, int report_errors)
     struct stepper_moves s;
     fill_stepper_moves(m, &s);
     uint16_t i;
-    uint32_t cur_step = 0;
+    uint32_t cur_step = 0, prev_step = 0;
     for (i = 0; i < m->count; ++i) {
         add_interval(&cur_step, &s);
         struct points point = minmax_point(sc, sc->queue_pos + i);
@@ -375,6 +378,8 @@ test_step_move(struct stepcompress *sc, struct step_move *m, int report_errors)
         m->last_step = cur_step;
         if (!m->first_step)
             m->first_step = cur_step;
+        m->last_step_interval = cur_step - prev_step;
+        prev_step = cur_step;
     }
     return 0;
 }
@@ -395,9 +400,10 @@ gen_avg_interval(struct stepcompress *sc, uint16_t count)
 {
     uint32_t lsc = sc->last_step_clock;
     double d = sc->queue_pos[count-1] - lsc;
+    d += FIRST_STEP_BIAS * sc->next_expected_interval;
     struct rhs_3 f;
-    f.b0 = d / count;
-    f.b1 = f.b2 = 0.;
+    memset(&f, 0, sizeof(f));
+    f.b0 = d / (count + FIRST_STEP_BIAS);
     return step_move_encode(count, &f);
 }
 
@@ -442,7 +448,8 @@ compress_bisect_count(struct stepcompress *sc)
     }
     if (best.count <= 1) {
         uint32_t interval = *sc->queue_pos - (uint32_t)sc->last_step_clock;
-        return (struct step_move){ interval, 1, 0, 0, 0, interval, interval };
+        return (struct step_move){ interval, 1, 0, 0, 0,
+                                   interval, interval, interval };
     }
     return best;
 }
@@ -570,6 +577,12 @@ static void
 add_move(struct stepcompress *sc, uint64_t first_clock, struct step_move *move)
 {
     uint64_t last_clock = sc->last_step_clock + move->last_step;
+    uint32_t next_expected_interval = 0;
+    if (move->count > 3) {
+        --move->count;
+        last_clock -= move->last_step_interval;
+        next_expected_interval = move->last_step_interval;
+    }
 
     // Create and queue a queue_step command
     uint32_t msg[7] = {
@@ -582,6 +595,7 @@ add_move(struct stepcompress *sc, uint64_t first_clock, struct step_move *move)
         qm->req_clock = first_clock;
     list_add_tail(&qm->node, &sc->msg_queue);
     sc->last_step_clock = last_clock;
+    sc->next_expected_interval = next_expected_interval;
 
     // Create and store move in history tracking
     struct history_steps *hs = malloc(sizeof(*hs));
@@ -604,6 +618,10 @@ queue_flush(struct stepcompress *sc, uint64_t move_clock)
     if (sc->queue_pos >= sc->queue_next)
         return 0;
     while (sc->last_step_clock < move_clock) {
+        if (!sc->next_expected_interval) {
+            sc->next_expected_interval =
+                *sc->queue_pos - (uint32_t)sc->last_step_clock;
+        }
         struct step_move move = compress_bisect_count(sc);
         int ret = check_line(sc, move);
         if (ret)
@@ -626,7 +644,8 @@ static int
 stepcompress_flush_far(struct stepcompress *sc, uint64_t abs_step_clock)
 {
     uint64_t interval = abs_step_clock - sc->last_step_clock;
-    struct step_move move = { interval, 1, 0, 0, 0, interval, interval };
+    struct step_move move = { interval, 1, 0, 0, 0,
+                              interval, interval, interval };
     add_move(sc, abs_step_clock, &move);
     calc_last_step_print_time(sc);
     return 0;
