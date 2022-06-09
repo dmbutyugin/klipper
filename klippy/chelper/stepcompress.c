@@ -258,11 +258,12 @@ minmax_point(struct stepcompress *sc, uint32_t *pos)
     uint32_t nextpoint = pos + 1 < sc->queue_next ? *(pos+1) - lsc : point;
     uint32_t max_bck_error = (point - prevpoint) >> MAX_ERR_2P;
     uint32_t max_frw_error = (nextpoint - point) >> MAX_ERR_2P;
-    if (max_bck_error > sc->max_error)
-        max_bck_error = sc->max_error;
-    if (max_frw_error > sc->max_error)
-        max_frw_error = sc->max_error;
-    return (struct points){ point - max_bck_error, point + max_frw_error };
+    uint32_t max_error = sc->max_error;
+    if (max_error > max_bck_error)
+        max_error = max_bck_error;
+    if (max_frw_error && max_error > max_frw_error)
+        max_error = max_frw_error;
+    return (struct points){ point - max_error, point + max_error };
 }
 
 struct stepper_moves {
