@@ -269,20 +269,28 @@ command_queue_step(uint32_t *args)
     int16_t add = args[3];
     int16_t add2 = args[4];
     int8_t shift = args[5];
+    uint_fast8_t low_shift = 16 - shift;
 
     if (shift > 0) {
         m->interval = interval >> shift;
-        m->int_low = (interval << (16 - shift)) & 0xFFFF;
+        m->int_low = interval << low_shift;
     } else {
         m->interval = interval << -shift;
         m->int_low = 0;
     }
     // Left shift of a signed int is an undefined behavior,
-    // use addition instead.
+    // use addition (on 8 bit) or multiplication instead.
     int32_t add_shifted = add, add2_shifted = add2;
-    for (uint_fast8_t i = 16 - shift; i > 0; --i) {
-        add_shifted += add_shifted;
-        add2_shifted += add2_shifted;
+    if (CONFIG_MACH_AVR) {
+        for (uint_fast8_t i = low_shift; i > 0; --i) {
+            add_shifted += add_shifted;
+            add2_shifted += add2_shifted;
+        }
+    } else {
+        // On 32 bit MCUs this is translated into efficient shift
+        int32_t mult = 1 << low_shift;
+        add_shifted *= mult;
+        add2_shifted *= mult;
     }
     m->add = add_shifted;
     m->add2 = add2_shifted;
