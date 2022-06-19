@@ -306,21 +306,21 @@ fill_stepper_moves(struct step_move *m, struct stepper_moves *s)
     int16_t add = m->add;
     int16_t add2 = m->add2;
     int8_t shift = m->shift;
+    uint_fast8_t low_shift = 16 - shift;
 
     if (shift > 0) {
         s->interval = interval >> shift;
-        s->int_low = (interval << (16 - shift)) & 0xFFFF;
+        s->int_low = interval << low_shift;
     } else {
         s->interval = interval << -shift;
         s->int_low = 0;
     }
-    // Left shift of the signed int is undefined behavior,
-    // use addition instead.
+    // Left shift of a signed int is an undefined behavior in C
     int32_t add_shifted = add, add2_shifted = add2;
-    for (uint_fast8_t i = 16 - shift; i > 0; --i) {
-        add_shifted += add_shifted;
-        add2_shifted += add2_shifted;
-    }
+    // On 32 bit MCUs this is translated into efficient shift
+    int32_t mult = 1 << low_shift;
+    add_shifted *= mult;
+    add2_shifted *= mult;
     s->add = add_shifted;
     s->add2 = add2_shifted;
     s->int_low_acc = 0;
