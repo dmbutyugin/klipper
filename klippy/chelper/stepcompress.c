@@ -269,7 +269,7 @@ minmax_point(struct stepcompress *sc, uint32_t *pos)
 struct stepper_moves {
     uint32_t interval;
     uint16_t int_low;
-    int32_t int_low_acc;
+    uint16_t int_low_acc;
     int32_t add;
     int32_t add2;
     uint32_t count;
@@ -280,13 +280,10 @@ add_interval(uint32_t* time, struct stepper_moves *s)
 {
     uint32_t next_time = *time + s->interval;
     if (likely(s->int_low)) {
-        int32_t int_low_acc = s->int_low_acc + s->int_low;
-        if (unlikely(int_low_acc >= 0 && ((int_low_acc & 0x00008000) ||
-                                          ((int_low_acc >> 16) & 0xff)))) {
+        int32_t int_low_acc = (int16_t)s->int_low_acc + (int32_t)s->int_low;
+        if (unlikely(int_low_acc >= 0x8000))
             ++next_time;
-            int_low_acc -= 0x10000;
-        }
-        s->int_low_acc = int_low_acc;
+        s->int_low_acc = (uint32_t)int_low_acc & 0xFFFF;
     }
     *time = next_time;
 }
@@ -297,10 +294,7 @@ inc_interval(struct stepper_moves *s)
     uint32_t int_add = (uint32_t)(s->int_low + s->add);
     s->int_low = int_add & 0xffff;
     uint16_t int_add_high = int_add >> 16;
-    if (!(int_add_high & 0x8000))
-        s->interval += int_add_high;
-    else
-        s->interval -= (uint16_t)~int_add_high + 1;
+    s->interval += (int16_t)int_add_high;
     s->add += s->add2;
 }
 
