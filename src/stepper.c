@@ -70,8 +70,8 @@ add_interval(uint32_t* time, struct stepper *s)
 {
     uint32_t next_time = *time + s->interval;
     if (likely(s->int_low)) {
-        int32_t int_low_acc = (int16_t)s->int_low_acc + (int32_t)s->int_low;
-        if (unlikely(int_low_acc >= 0x8000))
+        int32_t int_low_acc = s->int_low_acc + (int32_t)s->int_low;
+        if (unlikely(int_low_acc >= 0x10000))
             ++next_time;
         s->int_low_acc = (uint32_t)int_low_acc & 0xFFFF;
     }
@@ -105,7 +105,7 @@ stepper_load_next(struct stepper *s)
     s->int_low = m->int_low;
     s->add = m->add;
     s->add2 = m->add2;
-    s->int_low_acc = 0;
+    s->int_low_acc = 0x8000;
     if (HAVE_SINGLE_SCHEDULE && s->flags & SF_SINGLE_SCHED) {
         add_interval(&s->time.waketime, s);
         if (HAVE_AVR_OPTIMIZATION) {

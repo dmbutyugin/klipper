@@ -280,8 +280,8 @@ add_interval(uint32_t* time, struct stepper_moves *s)
 {
     uint32_t next_time = *time + s->interval;
     if (likely(s->int_low)) {
-        int32_t int_low_acc = (int16_t)s->int_low_acc + (int32_t)s->int_low;
-        if (unlikely(int_low_acc >= 0x8000))
+        int32_t int_low_acc = s->int_low_acc + (int32_t)s->int_low;
+        if (unlikely(int_low_acc >= 0x10000))
             ++next_time;
         s->int_low_acc = (uint32_t)int_low_acc & 0xFFFF;
     }
@@ -323,7 +323,7 @@ fill_stepper_moves(struct step_move *m, struct stepper_moves *s)
     add2_shifted *= mult;
     s->add = add_shifted;
     s->add2 = add2_shifted;
-    s->int_low_acc = 0;
+    s->int_low_acc = 0x8000;
 }
 
 static int
