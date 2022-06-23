@@ -180,18 +180,6 @@ solve_3x3(struct matrix_3x3 *m, struct rhs_3 *f)
     f->b0 -= f->b1 * m->a10 + f->b2 * m->a20;
 }
 
-static struct matrix_3x3*
-get_least_squares_ldl_3x3(uint16_t count)
-{
-    if (count > MAX_COUNT_LSM) return NULL;
-    struct matrix_3x3 *m = &least_squares_ldl[count-1];
-    if (!m->a00) {
-        fill_least_squares_matrix_3x3(count, m);
-        compute_ldl_3x3(m);
-    }
-    return m;
-}
-
 static struct step_move
 step_move_encode(uint16_t count, struct rhs_3* f)
 {
@@ -382,7 +370,12 @@ test_step_move(struct stepcompress *sc, struct step_move *m, int report_errors)
 static struct step_move
 test_step_count(struct stepcompress *sc, uint16_t count)
 {
-    struct matrix_3x3 *m = get_least_squares_ldl_3x3(count);
+    if (count > MAX_COUNT_LSM) {
+        struct step_move res;
+        memset(&res, 0, sizeof(res));
+        return res;
+    }
+    struct matrix_3x3 *m = &least_squares_ldl[count-1];
     struct rhs_3 f = sc->rhs_cache[count-1];
     solve_3x3(m, &f);
     struct step_move res = step_move_encode(count, &f);
@@ -479,6 +472,12 @@ stepcompress_alloc(uint32_t oid)
     sc->oid = oid;
     sc->sdir = -1;
     sc->rhs_cache = malloc(sizeof(sc->rhs_cache[0]) * MAX_COUNT_LSM);
+    if (!least_squares_ldl[0].a00)
+        for (int i = 0; i < MAX_COUNT_LSM; ++i) {
+            struct matrix_3x3 *m = &least_squares_ldl[i];
+            fill_least_squares_matrix_3x3(i+1, m);
+            compute_ldl_3x3(m);
+        }
     return sc;
 }
 
