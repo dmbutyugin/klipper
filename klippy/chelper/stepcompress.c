@@ -41,6 +41,7 @@
 #define MAX_ADD2 0xFFF
 #define MAX_SHIFT 16
 #define MIN_SHIFT -8
+#define MAX_INT32 0x7FFFFFFF
 
 struct stepcompress {
     // Buffer management
@@ -186,7 +187,7 @@ step_move_encode(uint16_t count, struct rhs_3* f)
     struct step_move res;
     memset(&res, 0, sizeof(res));
     double interval = f->b0, add = f->b1, add2 = f->b2;
-    if (interval < 0.)
+    if (interval < 0. || count > 0x7FFF)
         return res;
     if (count <= 1) {
         res.count = count;
@@ -214,14 +215,26 @@ step_move_encode(uint16_t count, struct rhs_3* f)
             return res;
     } else if (max_int_inc >= 0.5 ||
                count * fabs(interval-round(interval)) >= 0.5) {
-        while (res.shift < MAX_SHIFT &&
-                fabs(add * 2.) <= MAX_ADD && fabs(end_add * 2.) <= MAX_ADD &&
-                fabs(add2 * 2.) <= MAX_ADD2 && max_end_int * 2. <= MAX_INTRVL) {
-            interval *= 2.;
-            add *= 2.;
-            add2 *= 2.;
-            end_add *= 2.;
-            max_end_int *= 2.;
+        while (res.shift < MAX_SHIFT) {
+            double next_interval = interval * 2.;
+            double next_add = add * 2.;
+            double next_add2 = add2 * 2.;
+            double next_end_add = end_add * 2.;
+            double next_max_end_int = max_end_int * 2.;
+            int8_t next_shift = res.shift + 1;
+            uint_fast8_t extra_shift =
+                next_shift > 8 ? 16-next_shift : 8-next_shift;
+            if (fabs(next_add) > MAX_ADD || fabs(next_end_add) > MAX_ADD ||
+                fabs(next_add2) > MAX_ADD2 || next_max_end_int > MAX_INTRVL ||
+                next_interval * (1 << extra_shift) > MAX_INT32 ||
+                fabs(next_add * (1 << extra_shift)) > MAX_INT32 ||
+                fabs(next_add2 * (1 << extra_shift)) > MAX_INT32)
+                break;
+            interval = next_interval;
+            add = next_add;
+            add2 = next_add2;
+            end_add = next_end_add;
+            max_end_int = next_max_end_int;
             ++res.shift;
         }
     }
@@ -256,33 +269,33 @@ minmax_point(struct stepcompress *sc, uint32_t *pos)
 
 struct stepper_moves {
     uint32_t interval;
-    uint16_t int_low;
-    uint16_t int_low_acc;
     int32_t add;
     int32_t add2;
-    uint32_t count;
+    uint_fast8_t shift;
+    uint16_t int_low_acc;
+    uint16_t count;
 };
 
 static inline void
 add_interval(uint32_t* time, struct stepper_moves *s)
 {
-    uint32_t next_time = *time + s->interval;
-    if (likely(s->int_low)) {
-        int32_t int_low_acc = s->int_low_acc + (int32_t)s->int_low;
-        if (unlikely(int_low_acc >= 0x10000))
-            ++next_time;
-        s->int_low_acc = (uint32_t)int_low_acc & 0xFFFF;
+    if (s->shift == 16) {
+        uint32_t interval = s->interval + s->int_low_acc;
+        *time += interval >> 16;
+        s->int_low_acc = interval & 0xFFFF;
+    } else if (s->shift == 8) {
+        uint32_t interval = s->interval + s->int_low_acc;
+        *time += interval >> 8;
+        s->int_low_acc = interval & 0xFF;
+    } else {
+        *time += s->interval;
     }
-    *time = next_time;
 }
 
 static inline void
 inc_interval(struct stepper_moves *s)
 {
-    uint32_t int_add = (uint32_t)(s->int_low + s->add);
-    s->int_low = int_add & 0xffff;
-    uint16_t int_add_high = int_add >> 16;
-    s->interval += (int16_t)int_add_high;
+    s->interval += s->add;
     s->add += s->add2;
 }
 
@@ -291,27 +304,35 @@ fill_stepper_moves(struct step_move *m, struct stepper_moves *s)
 {
     s->count = m->count;
     uint32_t interval = m->interval;
-    int16_t add = m->add;
-    int16_t add2 = m->add2;
+    int32_t add = m->add;
+    int32_t add2 = m->add2;
     int8_t shift = m->shift;
-    uint_fast8_t low_shift = 16 - shift;
 
-    if (shift > 0) {
-        s->interval = interval >> shift;
-        s->int_low = interval << low_shift;
+    if (shift <= 0) {
+        interval <<= -shift;
+        // Left shift of a negative int is an undefined behavior in C
+        add = add >= 0 ? add << -shift : -(-add << -shift);
+        add2 = add2 >= 0 ? add2 << -shift : -(-add2 << -shift);
+        s->interval = interval;
+        s->add = add;
+        s->add2 = add2;
+        s->int_low_acc = 0;
+        s->shift = 0;
     } else {
-        s->interval = interval << -shift;
-        s->int_low = 0;
+        uint_fast8_t extra_shift = shift > 8 ? 16-shift : 8-shift;
+        s->shift = shift > 8 ? 16 : 8;
+        interval <<= extra_shift;
+        add = add >= 0 ? add << extra_shift : -(-add << extra_shift);
+        add2 = add2 >= 0 ? add2 << extra_shift : -(-add2 << extra_shift);
+        s->interval = interval;
+        s->add = add;
+        s->add2 = add2;
+        if (s->shift == 16) {
+            s->int_low_acc = 1 << 15;
+        } else {  // s->shift == 8
+            s->int_low_acc = 1 << 7;
+        }
     }
-    // Left shift of a signed int is an undefined behavior in C
-    int32_t add_shifted = add, add2_shifted = add2;
-    // On 32 bit MCUs this is translated into efficient shift
-    int32_t mult = 1 << low_shift;
-    add_shifted *= mult;
-    add2_shifted *= mult;
-    s->add = add_shifted;
-    s->add2 = add2_shifted;
-    s->int_low_acc = 0x8000;
 }
 
 static int
@@ -319,6 +340,7 @@ test_step_move(struct stepcompress *sc, struct step_move *m, int report_errors)
 {
     if (!m->count || (!m->interval && !m->add && !m->add2 && m->count > 1)
         || m->interval >= 0x80000000
+        || m->count > 0x7FFF
         || m->add < -MAX_ADD || m->add > MAX_ADD
         || m->add2 < -MAX_ADD2 || m->add2 > MAX_ADD2
         || m->shift > MAX_SHIFT || m->shift < MIN_SHIFT) {
@@ -402,8 +424,8 @@ compress_bisect_count(struct stepcompress *sc)
     struct step_move cur, best;
     best.count = 0;
     compute_rhs_3(sc, /*count=*/1, &sc->rhs_cache[0], NULL);
-    uint16_t queue_size = sc->queue_next < sc->queue_pos + 32767
-                        ? sc->queue_next - sc->queue_pos : 32767;
+    uint16_t queue_size = sc->queue_next < sc->queue_pos + 0x7FFF
+                        ? sc->queue_next - sc->queue_pos : 0x7FFF;
     uint16_t i = 2, left = 0, right = 8;
     for (; right <= MAX_COUNT_LSM && right <= queue_size; right <<= 1) {
         for (; i <= right; ++i)
