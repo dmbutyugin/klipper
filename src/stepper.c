@@ -31,10 +31,12 @@
 
 struct stepper_move {
     struct move_node node;
+    uint32_t first_interval;
     uint32_t interval;
-    uint16_t int_low;
     int32_t add;
     int32_t add2;
+    uint_fast8_t shift;
+    uint16_t int_low_acc;
     uint16_t count;
     uint8_t flags;
 };
@@ -44,11 +46,11 @@ enum { MF_DIR=1<<0 };
 struct stepper {
     struct timer time;
     uint32_t interval;
-    uint16_t int_low;
-    uint16_t int_low_acc;
     int32_t add;
     int32_t add2;
-    uint32_t count;
+    uint_fast8_t shift;
+    uint16_t int_low_acc;
+    uint16_t count;
     uint32_t next_step_time, step_pulse_ticks;
     struct gpio_out step_pin, dir_pin;
     uint32_t position;
@@ -68,23 +70,29 @@ enum {
 static inline void
 add_interval(uint32_t* time, struct stepper *s)
 {
-    uint32_t next_time = *time + s->interval;
-    if (likely(s->int_low)) {
-        int32_t int_low_acc = s->int_low_acc + (int32_t)s->int_low;
-        if (unlikely(int_low_acc >= 0x10000))
-            ++next_time;
-        s->int_low_acc = (uint32_t)int_low_acc & 0xFFFF;
+    if (CONFIG_MACH_AVR) {
+        if (s->shift == 16) {
+            uint32_t interval = s->interval + s->int_low_acc;
+            *time += interval >> 16;
+            s->int_low_acc = interval & 0xFFFF;
+        } else if (s->shift == 8) {
+            uint32_t interval = s->interval + s->int_low_acc;
+            *time += interval >> 8;
+            s->int_low_acc = interval & 0xFF;
+        } else {
+            *time += s->interval;
+        }
+    } else {
+        uint32_t interval = s->interval + s->int_low_acc;
+        *time += interval >> s->shift;
+        s->int_low_acc = interval - ((interval >> s->shift) << s->shift);
     }
-    *time = next_time;
 }
 
 static inline void
 inc_interval(struct stepper *s)
 {
-    uint32_t int_add = (int32_t)s->int_low + s->add;
-    s->int_low = int_add & 0xffff;
-    uint16_t int_add_high = int_add >> 16;
-    s->interval += (int16_t)int_add_high;
+    s->interval += s->add;
     s->add += s->add2;
 }
 
@@ -102,30 +110,26 @@ stepper_load_next(struct stepper *s)
     struct move_node *mn = move_queue_pop(&s->mq);
     struct stepper_move *m = container_of(mn, struct stepper_move, node);
     s->interval = m->interval;
-    s->int_low = m->int_low;
     s->add = m->add;
     s->add2 = m->add2;
-    s->int_low_acc = 0x8000;
+    s->shift = m->shift;
+    s->int_low_acc = m->int_low_acc;
     if (HAVE_SINGLE_SCHEDULE && s->flags & SF_SINGLE_SCHED) {
-        add_interval(&s->time.waketime, s);
+        s->time.waketime += m->first_interval;
         if (HAVE_AVR_OPTIMIZATION) {
-            if (m->add || m->add2) {
-                inc_interval(s);
+            if (m->flags & SF_HAVE_ADD) {
                 s->flags = s->flags |  SF_HAVE_ADD;
             } else {
                 s->flags = s->flags & ~SF_HAVE_ADD;
             }
-        } else {
-            inc_interval(s);
         }
         s->count = m->count;
     } else {
         // It is necessary to schedule unstep events and so there are
         // twice as many events.
-        add_interval(&s->next_step_time, s);
-        inc_interval(s);
+        s->next_step_time += m->first_interval;
         s->time.waketime = s->next_step_time;
-        s->count = (uint32_t)m->count * 2;
+        s->count = m->count * 2;
     }
     // Add all steps to s->position (stepper_get_position() can calc mid-move)
     if (m->flags & MF_DIR) {
@@ -145,7 +149,7 @@ stepper_event_edge(struct timer *t)
 {
     struct stepper *s = container_of(t, struct stepper, time);
     gpio_out_toggle_noirq(s->step_pin);
-    uint32_t count = s->count - 1;
+    uint16_t count = s->count - 1;
     if (likely(count)) {
         s->count = count;
         add_interval(&s->time.waketime, s);
@@ -163,9 +167,9 @@ stepper_event_avr(struct timer *t)
 {
     struct stepper *s = container_of(t, struct stepper, time);
     gpio_out_toggle_noirq(s->step_pin);
-    uint16_t *pcount = (void*)&s->count, count = *pcount - 1;
+    uint16_t count = s->count - 1;
     if (likely(count)) {
-        *pcount = count;
+        s->count = count;
         add_interval(&s->time.waketime, s);
         gpio_out_toggle_noirq(s->step_pin);
         if (s->flags & SF_HAVE_ADD)
@@ -263,39 +267,61 @@ command_queue_step(uint32_t *args)
     struct stepper *s = stepper_oid_lookup(args[0]);
     struct stepper_move *m = move_alloc();
     m->count = args[2];
-    if (!m->count)
+    if (!m->count || m->count >= 0x8000)
         shutdown("Invalid count parameter");
     uint32_t interval = args[1];
-    int16_t add = args[3];
-    int16_t add2 = args[4];
+    int32_t add = args[3];
+    int32_t add2 = args[4];
     int8_t shift = args[5];
-    uint_fast8_t low_shift = 16 - shift;
 
-    if (shift > 0) {
-        m->interval = interval >> shift;
-        m->int_low = interval << low_shift;
-    } else {
-        m->interval = interval << -shift;
-        m->int_low = 0;
-    }
-    // Left shift of a signed int is an undefined behavior,
-    // use addition (on 8 bit) or multiplication instead.
-    int32_t add_shifted = add, add2_shifted = add2;
-    if (CONFIG_MACH_AVR) {
-        for (uint_fast8_t i = low_shift; i > 0; --i) {
-            add_shifted += add_shifted;
-            add2_shifted += add2_shifted;
+    if (shift <= 0) {
+        interval <<= -shift;
+        // Left shift of a negative int is an undefined behavior in C
+        add = add >= 0 ? add << -shift : -(-add << -shift);
+        add2 = add2 >= 0 ? add2 << -shift : -(-add2 << -shift);
+        m->interval = interval + add;
+        m->add = add + add2;
+        m->add2 = add2;
+        m->int_low_acc = 0;
+        m->first_interval = interval;
+        m->shift = 0;
+    } else if (CONFIG_MACH_AVR) {
+        uint_fast8_t extra_shift = shift > 8 ? 16-shift : 8-shift;
+        m->shift = shift > 8 ? 16 : 8;
+        interval <<= extra_shift;
+        add = add >= 0 ? add << extra_shift : -(-add << extra_shift);
+        add2 = add2 >= 0 ? add2 << extra_shift : -(-add2 << extra_shift);
+        m->interval = interval + add;
+        m->add = add + add2;
+        m->add2 = add2;
+        if (m->shift == 16) {
+            m->int_low_acc = 1 << 15;
+            interval += m->int_low_acc;
+            m->first_interval = interval >> 16;
+            m->int_low_acc = interval & 0xFFFF;
+        } else {  // m->shift == 8
+            m->int_low_acc = 1 << 7;
+            interval += m->int_low_acc;
+            m->first_interval = interval >> 8;
+            m->int_low_acc = interval & 0xFF;
         }
     } else {
-        // On 32 bit MCUs this is translated into efficient shift
-        int32_t mult = 1 << low_shift;
-        add_shifted *= mult;
-        add2_shifted *= mult;
+        m->interval = interval + add;
+        m->add = add + add2;
+        m->add2 = add2;
+        m->int_low_acc = 1 << (shift - 1);
+        interval += m->int_low_acc;
+        m->first_interval = interval >> shift;
+        m->int_low_acc = interval - ((interval >> shift) << shift);
+        m->shift = shift;
     }
-    m->add = add_shifted;
-    m->add2 = add2_shifted;
 
     m->flags = 0;
+    if (HAVE_AVR_OPTIMIZATION) {
+        if (m->add || m->add2) {
+            m->flags |= SF_HAVE_ADD;
+        }
+    }
 
     irq_disable();
     uint8_t flags = s->flags;
