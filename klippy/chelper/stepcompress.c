@@ -104,6 +104,8 @@ struct history_steps {
 // the end of the generated step_move sequence.
 #define FIRST_STEP_BIAS 1.0
 
+#define A2_REGULARIZATION 0.01
+
 struct matrix_3x3 {
     double a00, a10, a11, a20, a21, a22;
 };
@@ -132,6 +134,7 @@ fill_least_squares_matrix_3x3(uint16_t count, struct matrix_3x3 *m)
         m->a22 += (double)c2 * c2;
     }
     m->a00 += FIRST_STEP_BIAS;
+    m->a22 += A2_REGULARIZATION;
     if (i < 2) m->a11 = 1.;
     if (i < 3) m->a22 = 1.;
 }
