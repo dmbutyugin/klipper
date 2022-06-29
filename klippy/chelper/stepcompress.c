@@ -31,6 +31,10 @@
 // Maximum error between compressed and actual step,
 // in the form of (step_i - step_{i-1}) >> MAX_ERR_2P
 #define MAX_ERR_2P 6
+// Minimum tolerable step error in clock ticks. Step errors
+// below this value are ignored as they are getting close
+// to the integer precision of a single clock tick.
+#define MIN_STEP_ERR 3
 // Limits on step_move values for the least squares method
 #define MAX_COUNT_LSM 1024
 #define MAX_COUNT_BISECT 256
@@ -62,7 +66,9 @@ struct stepcompress {
     // History tracking
     int64_t last_position;
     struct list_head history_list;
+    uint16_t cached_count;
     struct rhs_3 *rhs_cache;
+    struct points *errb_cache;
 };
 
 struct step_move {
@@ -255,16 +261,30 @@ static inline struct points
 minmax_point(struct stepcompress *sc, uint32_t *pos)
 {
     uint32_t lsc = sc->last_step_clock, point = *pos - lsc;
-    uint32_t prevpoint = pos > sc->queue_pos ? *(pos-1) - lsc : 0;
-    uint32_t nextpoint = pos + 1 < sc->queue_next ? *(pos+1) - lsc : point;
-    uint32_t max_bck_error = (point - prevpoint) >> MAX_ERR_2P;
-    uint32_t max_frw_error = (nextpoint - point) >> MAX_ERR_2P;
-    uint32_t max_error = sc->max_error;
-    if (max_error > max_bck_error)
-        max_error = max_bck_error;
-    if (max_frw_error && max_error > max_frw_error)
-        max_error = max_frw_error;
-    return (struct points){ point - max_error, point + max_error };
+
+    uint32_t max_bck_error = pos > sc->queue ? *pos - *(pos-1) : point;
+    max_bck_error = (max_bck_error + (1 << (MAX_ERR_2P - 1))) >> MAX_ERR_2P;
+    if (max_bck_error < MIN_STEP_ERR) max_bck_error = MIN_STEP_ERR;
+    if (max_bck_error > sc->max_error) max_bck_error = sc->max_error;
+
+    uint32_t max_frw_error = pos + 1 < sc->queue_next ? *(pos+1) - *pos : (
+            sc->next_step_clock ? (uint32_t)sc->next_step_clock - *pos : 0);
+    max_frw_error = (max_frw_error + (1 << (MAX_ERR_2P - 1))) >> MAX_ERR_2P;
+    if (max_frw_error) {
+        if (max_frw_error < MIN_STEP_ERR) max_frw_error = MIN_STEP_ERR;
+        if (max_bck_error > max_frw_error) max_bck_error = max_frw_error;
+        if (max_frw_error > max_bck_error) max_frw_error = max_bck_error;
+    } else max_frw_error = MIN_STEP_ERR;
+
+    return (struct points){ point - max_bck_error, point + max_frw_error };
+}
+
+static inline struct points
+get_cached_minmax_point(struct stepcompress *sc, uint16_t ind)
+{
+    if (ind < MAX_COUNT_LSM && ind < sc->cached_count)
+        return sc->errb_cache[ind];
+    return minmax_point(sc, sc->queue_pos + ind);
 }
 
 struct stepper_moves {
@@ -357,7 +377,7 @@ test_step_move(struct stepcompress *sc, struct step_move *m, int report_errors)
     uint32_t cur_step = 0, prev_step = 0;
     for (i = 0; i < m->count; ++i) {
         add_interval(&cur_step, &s);
-        struct points point = minmax_point(sc, sc->queue_pos + i);
+        struct points point = get_cached_minmax_point(sc, i);
         if (cur_step < point.minp || cur_step > point.maxp) {
             if (report_errors)
                 errorf("stepcompress o=%d i=%d c=%d a=%d, a2=%d, s=%d:"
@@ -392,7 +412,7 @@ test_step_move(struct stepcompress *sc, struct step_move *m, int report_errors)
 static struct step_move
 test_step_count(struct stepcompress *sc, uint16_t count)
 {
-    if (count > MAX_COUNT_LSM) {
+    if (count > MAX_COUNT_LSM || sc->cached_count < count) {
         struct step_move res;
         memset(&res, 0, sizeof(res));
         return res;
@@ -417,19 +437,34 @@ gen_avg_interval(struct stepcompress *sc, uint16_t count)
     return step_move_encode(count, &f);
 }
 
+inline static void
+update_caches_to_count(struct stepcompress *sc, uint16_t count)
+{
+    if (!sc->cached_count) {
+        compute_rhs_3(sc, /*count=*/1, &sc->rhs_cache[0], NULL);
+        sc->errb_cache[0] = minmax_point(sc, sc->queue_pos);
+        sc->cached_count = 1;
+    }
+    uint16_t i;
+    for (i = sc->cached_count + 1; i <= count && i <= MAX_COUNT_LSM; ++i) {
+        compute_rhs_3(sc, i, &sc->rhs_cache[i-1], &sc->rhs_cache[i-2]);
+        sc->errb_cache[i-1] = minmax_point(sc, sc->queue_pos+i-1);
+    }
+    sc->cached_count = i - 1;
+}
+
 // Find a 'step_move' that covers a series of step times
 static struct step_move
 compress_bisect_count(struct stepcompress *sc)
 {
+    sc->cached_count = 0;
     struct step_move cur, best;
     best.count = 0;
-    compute_rhs_3(sc, /*count=*/1, &sc->rhs_cache[0], NULL);
     uint16_t queue_size = sc->queue_next < sc->queue_pos + 0x7FFF
                         ? sc->queue_next - sc->queue_pos : 0x7FFF;
-    uint16_t i = 2, left = 0, right = 8;
+    uint16_t left = 0, right = 8;
     for (; right <= MAX_COUNT_LSM && right <= queue_size; right <<= 1) {
-        for (; i <= right; ++i)
-            compute_rhs_3(sc, i, &sc->rhs_cache[i-1], &sc->rhs_cache[i-2]);
+        update_caches_to_count(sc, right);
         cur = test_step_count(sc, right);
         if (cur.count > left) {
             best = cur;
@@ -439,6 +474,7 @@ compress_bisect_count(struct stepcompress *sc)
     }
     if (best.count >= MAX_COUNT_BISECT) {
         for (; right <= queue_size; right <<= 1) {
+            update_caches_to_count(sc, right);
             cur = gen_avg_interval(sc, right);
             test_step_move(sc, &cur, /*report_errors=*/0);
             if (cur.count > best.count) best = cur;
@@ -447,8 +483,7 @@ compress_bisect_count(struct stepcompress *sc)
         return best;
     }
     if (right > MAX_COUNT_LSM) right = MAX_COUNT_LSM + 1;
-    for (; i < right; ++i)
-        compute_rhs_3(sc, i, &sc->rhs_cache[i-1], &sc->rhs_cache[i-2]);
+    update_caches_to_count(sc, right);
     while (right - left > 1) {
         uint16_t count = (left + right) / 2;
         cur = test_step_count(sc, count);
@@ -494,6 +529,7 @@ stepcompress_alloc(uint32_t oid)
     sc->oid = oid;
     sc->sdir = -1;
     sc->rhs_cache = malloc(sizeof(sc->rhs_cache[0]) * MAX_COUNT_LSM);
+    sc->errb_cache = malloc(sizeof(sc->errb_cache[0]) * MAX_COUNT_LSM);
     if (!least_squares_ldl[0].a00)
         for (int i = 0; i < MAX_COUNT_LSM; ++i) {
             struct matrix_3x3 *m = &least_squares_ldl[i];
@@ -546,6 +582,7 @@ stepcompress_free(struct stepcompress *sc)
     if (!sc)
         return;
     free(sc->rhs_cache);
+    free(sc->errb_cache);
     free(sc->queue);
     message_queue_free(&sc->msg_queue);
     free_history(sc, UINT64_MAX);
