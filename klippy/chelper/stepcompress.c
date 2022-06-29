@@ -103,6 +103,9 @@ struct history_steps {
 // between subsequent step_move(s) and pushing back the maximum errors towards
 // the end of the generated step_move sequence.
 #define FIRST_STEP_BIAS 1.0
+// Extra bias for the first step towards the previously expected step to try
+// if the step_move generated using the regular parameters fail early.
+#define EXTRA_FIRST_STEP_BIAS 19.0
 
 #define A2_REGULARIZATION 0.01
 
@@ -115,6 +118,7 @@ struct rhs_3 {
 };
 
 struct matrix_3x3 least_squares_ldl[MAX_COUNT_LSM] = {0};
+struct matrix_3x3 least_squares_efsb_ldl[MAX_COUNT_LSM] = {0};
 
 static void
 fill_least_squares_matrix_3x3(uint16_t count, struct matrix_3x3 *m)
@@ -425,6 +429,15 @@ test_step_count(struct stepcompress *sc, uint16_t count)
     solve_3x3(m, &f);
     struct step_move res = step_move_encode(count, &f);
     test_step_move(sc, &res, /*report_errors=*/0);
+    if (count > 20 && res.count < count / 4) {
+        m = &least_squares_efsb_ldl[count-1];
+        f = sc->rhs_cache[count-1];
+        f.b0 += EXTRA_FIRST_STEP_BIAS * sc->next_expected_interval;
+        solve_3x3(m, &f);
+        struct step_move efsb_res = step_move_encode(count, &f);
+        test_step_move(sc, &efsb_res, /*report_errors=*/0);
+        if (efsb_res.count > res.count) return efsb_res;
+    }
     return res;
 }
 
@@ -469,7 +482,7 @@ compress_bisect_count(struct stepcompress *sc)
     for (; right <= MAX_COUNT_LSM && right <= queue_size; right <<= 1) {
         update_caches_to_count(sc, right);
         cur = test_step_count(sc, right);
-        if (cur.count > left) {
+        if (cur.count > best.count) {
             best = cur;
             left = cur.count;
         }
@@ -490,9 +503,10 @@ compress_bisect_count(struct stepcompress *sc)
     while (right - left > 1) {
         uint16_t count = (left + right) / 2;
         cur = test_step_count(sc, count);
-        if (cur.count > best.count) best = cur;
-        if (cur.count < count) right = count;
-        if (cur.count > left) left = count;
+        if (cur.count > best.count) {
+            best = cur;
+            left = count;
+        } else right = count;
     }
     if (best.count <= 1) {
         uint32_t interval = *sc->queue_pos - (uint32_t)sc->last_step_clock;
@@ -537,6 +551,10 @@ stepcompress_alloc(uint32_t oid)
         for (int i = 0; i < MAX_COUNT_LSM; ++i) {
             struct matrix_3x3 *m = &least_squares_ldl[i];
             fill_least_squares_matrix_3x3(i+1, m);
+            compute_ldl_3x3(m);
+            m = &least_squares_efsb_ldl[i];
+            fill_least_squares_matrix_3x3(i+1, m);
+            m->a00 += EXTRA_FIRST_STEP_BIAS;
             compute_ldl_3x3(m);
         }
     return sc;
