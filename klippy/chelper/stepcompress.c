@@ -36,7 +36,9 @@
 #define MIN_STEP_ERR 3
 // Limits on step_move values for the least squares method
 #define MAX_COUNT_LSM 1024
-#define MAX_COUNT_BISECT 256
+// Maximum 'count' value for binary search, must be smaller
+// than the MAX_COUNT_LSM value
+#define MAX_COUNT_BISECT 512
 // Limits below are optimized for "message blocks" encoding
 // and underlying storage types and MCU-side implementation
 #define MAX_INTRVL 0x3FFFFFF
@@ -515,9 +517,8 @@ compress_bisect_count(struct stepcompress *sc)
         }
         else break;
     }
-    if (best.count >= MAX_COUNT_BISECT) {
+    if (right >= MAX_COUNT_BISECT) {
         for (; right <= queue_size; right <<= 1) {
-            update_caches_to_count(sc, right);
             cur = gen_avg_interval(sc, right);
             test_step_move(sc, &cur, /*report_errors=*/0, /*trunc_move=*/0);
             if (cur.count > best.count) best = cur;
@@ -525,8 +526,8 @@ compress_bisect_count(struct stepcompress *sc)
         }
         return best;
     }
-    if (right > MAX_COUNT_LSM) right = MAX_COUNT_LSM + 1;
-    update_caches_to_count(sc, right);
+    if (right > queue_size) right = queue_size + 1;
+    update_caches_to_count(sc, right - 1);
     while (right - left > 1) {
         uint16_t count = (left + right) / 2;
         cur = test_step_count(sc, count);
