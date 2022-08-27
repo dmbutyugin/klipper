@@ -401,7 +401,7 @@ test_step_move(struct stepcompress *sc, struct step_move *m, int report_errors
     for (i = 0; i < m->count; ++i) {
         add_interval(&cur_step, &s);
         struct points point = get_cached_minmax_point(sc, i);
-        if (cur_step < point.minp || cur_step > point.maxp) {
+        if ((int32_t)cur_step < point.minp || cur_step > point.maxp) {
             if (report_errors)
                 errorf("stepcompress o=%d i=%d c=%d a=%d, a2=%d, s=%d:"
                        " Point %u: %d not in %d:%d"
