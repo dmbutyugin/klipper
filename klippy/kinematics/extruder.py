@@ -287,9 +287,7 @@ class PrinterExtruder:
         extr_pos = self.last_position
         if move.is_kinematic_move:
             # Regular kinematic move with extrusion
-            inv_sum_r = 1. / sum([abs(r) for r in move.axes_r[:3]])
-            extr_r = [math.copysign(abs(r), axis_r) * inv_sum_r
-                      for r in move.axes_r[:3]]
+            extr_r = [math.copysign(r * r, axis_r) for r in move.axes_r[:3]]
         else:
             # Extrude-only move, do not apply pressure advance
             extr_r = [0., 0., axis_r]
