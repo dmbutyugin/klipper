@@ -11,7 +11,13 @@ class ExtruderStepper:
         self.printer = config.get_printer()
         self.name = config.get_name().split()[-1]
         self.pressure_advance = self.pressure_advance_smooth_time = 0.
+        self.linear_velocity = self.linear_offset = 0.
         self.config_pa = config.getfloat('pressure_advance', 0., minval=0.)
+        self.config_pa_lin_offset = config.getfloat(
+                'pressure_advance_linear_offset', 0., minval=0.)
+        self.config_pa_lin_vel = config.getfloat(
+                'pressure_advance_linear_velocity', 0., minval=0.,
+                above=(0. if self.config_pa_lin_offset else -1.))
         self.config_smooth_time = config.getfloat(
                 'pressure_advance_smooth_time', 0.040, above=0., maxval=.200)
         # Setup stepper
@@ -46,9 +52,13 @@ class ExtruderStepper:
     def _handle_connect(self):
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.register_step_generator(self.stepper.generate_steps)
-        self._set_pressure_advance(self.config_pa, self.config_smooth_time)
+        self._set_pressure_advance(self.config_pa, self.config_pa_lin_vel,
+                                   self.config_pa_lin_offset,
+                                   self.config_smooth_time)
     def get_status(self, eventtime):
         return {'pressure_advance': self.pressure_advance,
+                'linear_velocity': self.linear_velocity,
+                'linear_offset': self.linear_offset,
                 'smooth_time': self.pressure_advance_smooth_time}
     def find_past_position(self, print_time):
         mcu_pos = self.stepper.get_past_mcu_position(print_time)
@@ -65,20 +75,24 @@ class ExtruderStepper:
                                              % (extruder_name,))
         self.stepper.set_position([extruder.last_position, 0., 0.])
         self.stepper.set_trapq(extruder.get_trapq())
-    def _set_pressure_advance(self, pressure_advance, smooth_time):
+    def _set_pressure_advance(self, pressure_advance, linear_velocity,
+                              linear_offset, smooth_time):
         old_smooth_time = self.pressure_advance_smooth_time
-        if not self.pressure_advance:
+        if not self.pressure_advance and not self.linear_offset:
             old_smooth_time = 0.
         new_smooth_time = smooth_time
-        if not pressure_advance:
+        if not pressure_advance and not linear_offset:
             new_smooth_time = 0.
         toolhead = self.printer.lookup_object("toolhead")
         toolhead.note_step_generation_scan_time(new_smooth_time * .5,
                                                 old_delay=old_smooth_time * .5)
         ffi_main, ffi_lib = chelper.get_ffi()
         espa = ffi_lib.extruder_set_pressure_advance
-        espa(self.sk_extruder, pressure_advance, new_smooth_time)
+        espa(self.sk_extruder, linear_velocity, linear_offset, pressure_advance,
+             new_smooth_time)
         self.pressure_advance = pressure_advance
+        self.linear_velocity = linear_velocity
+        self.linear_offset = linear_offset
         self.pressure_advance_smooth_time = smooth_time
     cmd_SET_PRESSURE_ADVANCE_help = "Set pressure advance parameters"
     def cmd_default_SET_PRESSURE_ADVANCE(self, gcmd):
@@ -92,13 +106,22 @@ class ExtruderStepper:
     def cmd_SET_PRESSURE_ADVANCE(self, gcmd):
         pressure_advance = gcmd.get_float('ADVANCE', self.pressure_advance,
                                           minval=0.)
+        linear_offset = gcmd.get_float('LINEAR_OFFSET',
+                                       self.linear_offset, minval=0.)
+        linear_velocity = gcmd.get_float('LINEAR_VELOCITY',
+                                         self.linear_velocity, minval=0.,
+                                         above=(0. if linear_offset else -1.))
         smooth_time = gcmd.get_float('SMOOTH_TIME',
                                      self.pressure_advance_smooth_time,
                                      minval=0., maxval=.200)
-        self._set_pressure_advance(pressure_advance, smooth_time)
+        self._set_pressure_advance(pressure_advance, linear_velocity,
+                                   linear_offset, smooth_time)
         msg = ("pressure_advance: %.6f\n"
+               "linear_offset: %.6f\n"
+               "linear_velocity: %.6f\n"
                "pressure_advance_smooth_time: %.6f"
-               % (pressure_advance, smooth_time))
+               % (pressure_advance, linear_offset, linear_velocity,
+                   smooth_time))
         self.printer.set_rollover_info(self.name, "%s: %s" % (self.name, msg))
         gcmd.respond_info(msg, log=False)
     cmd_SET_E_ROTATION_DISTANCE_help = "Set extruder rotation distance"
