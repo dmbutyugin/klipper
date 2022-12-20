@@ -21,11 +21,14 @@
 //     pa_position(t) = (nominal_position(t)
 //                       + advance * nominal_velocity(t)
 //                       [ + advance2 * nominal_velocity(t)^2])
-// Which is then "smoothed" using a weighted average:
+// Where the nominal position and velocitiy are actually "smoothed" using
+// a weighted average prior to using PA formula:
 //     smooth_position(t) = (
-//         definitive_integral(pa_position(x) * (smooth_time/2 - abs(t-x)) * dx,
+//         definitive_integral(nominal_position(x) *
+//                                 (smooth_time/2 - abs(t-x)) * dx,
 //                             from=t-smooth_time/2, to=t+smooth_time/2)
 //         / ((smooth_time/2)**2))
+// and similarly for nominal_velocity(x).
 
 // Calculate the definitive integral of the motion formula:
 //   position(t) = base + t * (start_v + t * half_accel)
@@ -52,11 +55,12 @@ extruder_integrate_time(double base, double start_v, double half_accel
     return ei - si;
 }
 
-// Calculate the definitive integral of extruder for a given move
-static double
+// Calculate the definitive integrals of extruder for a given move
+static void
 pa_move_integrate(struct move *m, int axis, double linear_velocity
                   , double linear_offset, double linear_advance
-                  , double base, double start, double end, double time_offset)
+                  , double base, double start, double end, double time_offset
+                  , double *pos_integral, double *pa_vel_integral)
 {
     if (start < 0.)
         start = 0.;
@@ -65,43 +69,27 @@ pa_move_integrate(struct move *m, int axis, double linear_velocity
     double axis_r = m->axes_r.axis[axis - 'x'];
     double start_v = m->start_v * axis_r;
     double ha = m->half_accel * axis_r;
-    // Calculate base position and velocity with pressure advance
+    // Calculate base position and velocity for pressure advance
     int can_pressure_advance = m->axes_r.x > 0. || m->axes_r.y > 0.;
-    if (can_pressure_advance) {
-        double switch_t =
-            !ha || !linear_velocity ?  0.
-                                    : .5 * (linear_velocity - start_v) / ha;
-        if (switch_t > start && switch_t < end) {
-            double res = pa_move_integrate(
-                    m, axis, linear_velocity, linear_offset, linear_advance,
-                    base, start, switch_t, time_offset);
-            res += pa_move_integrate(
-                    m, axis, linear_velocity, linear_offset, linear_advance,
-                    base, switch_t, end, time_offset);
-            return res;
-        } else if (start_v + ha * (start + end) < linear_velocity) {
-            double recip_lv = 1. / linear_velocity;
-            base += (linear_advance
-                    + linear_offset * recip_lv * (2. - recip_lv * start_v)) * start_v;
-            start_v += (linear_advance
-                        + 2. * linear_offset * recip_lv * (1. - recip_lv * start_v)) * 2. * ha;
-            ha -= 4. * linear_offset * recip_lv * recip_lv * ha * ha;
-        } else {
-            base += linear_offset + linear_advance * start_v;
-            start_v += 2. * linear_advance * ha;
-        }
-    }
-    // Calculate definitive integral
+    // Calculate definitive integrals
     double iext = extruder_integrate(base, start_v, ha, start, end);
     double wgt_ext = extruder_integrate_time(base, start_v, ha, start, end);
-    return wgt_ext - time_offset * iext;
+    *pos_integral = wgt_ext - time_offset * iext;
+    if (!can_pressure_advance) {
+        *pa_vel_integral = 0.;
+    } else {
+        double ivel = extruder_integrate(start_v, 2. * ha, 0., start, end);
+        double wgt_vel = extruder_integrate_time(start_v, 2. * ha, 0., start, end);
+        *pa_vel_integral = wgt_vel - time_offset * ivel;
+    }
 }
 
-// Calculate the definitive integral of the extruder over a range of moves
-static double
+// Calculate the definitive integrals of the extruder over a range of moves
+static void
 pa_range_integrate(struct move *m, int axis, double move_time
                    , double linear_velocity, double linear_offset
-                   , double linear_advance, double hst)
+                   , double linear_advance, double hst
+                   , double *pos_integral, double *pa_vel_integral)
 {
     while (unlikely(move_time < 0.)) {
         m = list_prev_entry(m, node);
@@ -111,51 +99,67 @@ pa_range_integrate(struct move *m, int axis, double move_time
         move_time -= m->move_t;
         m = list_next_entry(m, node);
     }
-    // Calculate integral for the current move
-    double res = 0., start = move_time - hst, end = move_time + hst;
+    // Calculate integrals for the current move
+    double start = move_time - hst, end = move_time + hst;
     double start_base = m->start_pos.axis[axis - 'x'];
-    res += pa_move_integrate(m, axis, linear_velocity, linear_offset,
-                             linear_advance, 0., start, move_time, start);
-    res -= pa_move_integrate(m, axis, linear_velocity, linear_offset,
-                             linear_advance, 0., move_time, end, end);
+    *pos_integral = *pa_vel_integral = 0.;
+    double move_pos_int, move_pa_vel_int;
+    pa_move_integrate(
+            m, axis, linear_velocity, linear_offset, linear_advance, 0.,
+            start, move_time, start, &move_pos_int, &move_pa_vel_int);
+    *pos_integral += move_pos_int;
+    *pa_vel_integral += move_pa_vel_int;
+    pa_move_integrate(
+            m, axis, linear_velocity, linear_offset, linear_advance, 0.,
+            move_time, end, end, &move_pos_int, &move_pa_vel_int);
+    *pos_integral -= move_pos_int;
+    *pa_vel_integral -= move_pa_vel_int;
     // Integrate over previous moves
     struct move *prev = m;
     while (unlikely(start < 0.)) {
         prev = list_prev_entry(prev, node);
         start += prev->move_t;
         double base = prev->start_pos.axis[axis - 'x'] - start_base;
-        res += pa_move_integrate(
-                prev, axis, linear_velocity, linear_offset, linear_advance,
-                base, start, prev->move_t, start);
+        pa_move_integrate(prev, axis, linear_velocity, linear_offset,
+                          linear_advance, base, start, prev->move_t,
+                          start, &move_pos_int, &move_pa_vel_int);
+        *pos_integral += move_pos_int;
+        *pa_vel_integral += move_pa_vel_int;
     }
     // Integrate over future moves
     while (unlikely(end > m->move_t)) {
         end -= m->move_t;
         m = list_next_entry(m, node);
         double base = m->start_pos.axis[axis - 'x'] - start_base;
-        res -= pa_move_integrate(
-                m, axis, linear_velocity, linear_offset, linear_advance,
-                base, 0., end, end);
+        pa_move_integrate(m, axis, linear_velocity, linear_offset,
+                          linear_advance, base, 0., end, end,
+                          &move_pos_int, &move_pa_vel_int);
+        *pos_integral -= move_pos_int;
+        *pa_vel_integral -= move_pa_vel_int;
     }
-    return res + start_base * hst * hst;
+    *pos_integral += start_base * hst * hst;
 }
 
-static double
+static void
 shaper_pa_range_integrate(struct move *m, int axis, double move_time
                           , double linear_velocity, double linear_offset
                           , double linear_advance, double hst
-                          , struct shaper_pulses *sp)
+                          , struct shaper_pulses *sp
+                          , double *pos_integral, double *pa_vel_integral)
 {
-    double res = 0.;
     int num_pulses = sp->num_pulses, i;
+    *pos_integral = *pa_vel_integral = 0.;
     for (i = 0; i < num_pulses; ++i) {
         double t = sp->pulses[i].t, a = sp->pulses[i].a;
-        res += a * pa_range_integrate(
+        double pulse_pos_int, pulse_pa_vel_int;
+        pa_range_integrate(
                 m, axis, move_time + t, linear_velocity, linear_offset,
-                linear_advance, hst);
+                linear_advance, hst, &pulse_pos_int, &pulse_pa_vel_int);
+        *pos_integral += a * pulse_pos_int;
+        *pa_vel_integral += a * pulse_pa_vel_int;
     }
-    return res;
 }
+
 struct extruder_stepper {
     struct stepper_kinematics sk;
     struct shaper_pulses sp[3];
@@ -163,14 +167,14 @@ struct extruder_stepper {
     double half_smooth_time, inv_half_smooth_time2;
 };
 
-static double
-extruder_calc_position(struct stepper_kinematics *sk, struct move *m
-                       , double move_time)
+static void
+extruder_calc_position_and_pa_velocity(struct extruder_stepper *es
+                                       , struct move *m, double move_time
+                                       , double *pos, double *pa_vel)
 {
-    struct extruder_stepper *es = container_of(sk, struct extruder_stepper, sk);
     double hst = es->half_smooth_time;
     int i;
-    struct coord e_pos;
+    struct coord e_pos, e_vel;
     double move_dist = move_get_distance(m, move_time);
     for (i = 0; i < 3; ++i) {
         int axis = 'x' + i;
@@ -180,18 +184,44 @@ extruder_calc_position(struct stepper_kinematics *sk, struct move *m
             e_pos.axis[i] = num_pulses
                 ? shaper_calc_position(m, axis, move_time, sp)
                 : m->start_pos.axis[i] + m->axes_r.axis[i] * move_dist;
+            e_vel.axis[i] = 0.;
         } else {
-            double area = num_pulses
-                ? shaper_pa_range_integrate(
-                      m, axis, move_time, es->linear_velocity, es->linear_offset,
-                      es->linear_advance, hst, sp)
-                : pa_range_integrate(m, axis, move_time
-                                     , es->linear_velocity, es->linear_offset
-                                     , es->linear_advance, hst);
-            e_pos.axis[i] = area * es->inv_half_smooth_time2;
+            if (!num_pulses) {
+                pa_range_integrate(
+                        m, axis, move_time, es->linear_velocity,
+                        es->linear_offset, es->linear_advance, hst,
+                        e_pos.axis + i, e_vel.axis + i);
+            } else {
+                shaper_pa_range_integrate(
+                        m, axis, move_time, es->linear_velocity,
+                        es->linear_offset, es->linear_advance, hst, sp,
+                        e_pos.axis + i, e_vel.axis + i);
+            }
+            e_pos.axis[i] *= es->inv_half_smooth_time2;
+            e_vel.axis[i] *= es->inv_half_smooth_time2;
         }
     }
-    return e_pos.x + e_pos.y + e_pos.z;
+    *pos = e_pos.x + e_pos.y + e_pos.z;
+    *pa_vel = e_vel.x + e_vel.y + e_vel.z;
+}
+
+static double
+extruder_calc_position(struct stepper_kinematics *sk, struct move *m
+                       , double move_time)
+{
+    struct extruder_stepper *es = container_of(sk, struct extruder_stepper, sk);
+    double pos, pa_vel;
+    extruder_calc_position_and_pa_velocity(es, m, move_time, &pos, &pa_vel);
+    if (!es->half_smooth_time)
+        return pos;
+    pos += es->linear_advance * pa_vel;
+    if (pa_vel >= es->linear_velocity) {
+        pos += es->linear_offset;
+    } else {
+        double rel_vel = pa_vel / es->linear_velocity;
+        pos += es->linear_offset * rel_vel * (2. - rel_vel);
+    }
+    return pos;
 }
 
 static void
