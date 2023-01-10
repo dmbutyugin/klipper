@@ -4,6 +4,7 @@
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
+#include <math.h> // sqrt
 #include <stddef.h> // offsetof
 #include <stdlib.h> // malloc
 #include <string.h> // memset
@@ -140,7 +141,7 @@ extruder_calc_position(struct stepper_kinematics *sk, struct move *m
     if (pa_velocity < 0.) pa_velocity = 0.;
     if (pa_velocity < es->linear_velocity) {
         double rel_vel = pa_velocity / es->linear_velocity;
-        pa_pos += es->linear_offset * rel_vel * (2. - rel_vel);
+        pa_pos += es->linear_offset * (2. * sqrt(rel_vel) - rel_vel);
     } else {
         pa_pos += es->linear_offset;
     }
