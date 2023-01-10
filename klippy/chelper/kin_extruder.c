@@ -118,7 +118,8 @@ pa_range_integrate(struct move *m, double move_time, double hst
 
 struct extruder_stepper {
     struct stepper_kinematics sk;
-    double pressure_advance, half_smooth_time, inv_half_smooth_time2;
+    double linear_velocity, linear_offset, linear_advance;
+    double half_smooth_time, inv_half_smooth_time2;
 };
 
 static double
@@ -131,16 +132,25 @@ extruder_calc_position(struct stepper_kinematics *sk, struct move *m
         // Pressure advance not enabled
         return m->start_pos.x + move_get_distance(m, move_time);
     // Apply pressure advance and average over smooth_time
-    double pos_integral, pa_velocity_integral;
-    pa_range_integrate(m, move_time, hst, &pos_integral, &pa_velocity_integral);
-    double pa_smoothed_pos = es->inv_half_smooth_time2 * (
-            pos_integral + es->pressure_advance * pa_velocity_integral);
-    return m->start_pos.x + pa_smoothed_pos;
+    double pa_pos, pa_velocity;
+    pa_range_integrate(m, move_time, hst, &pa_pos, &pa_velocity);
+    pa_pos *= es->inv_half_smooth_time2;
+    pa_velocity *= es->inv_half_smooth_time2;
+    pa_pos += es->linear_advance * pa_velocity;
+    if (pa_velocity < 0.) pa_velocity = 0.;
+    if (pa_velocity < es->linear_velocity) {
+        double rel_vel = pa_velocity / es->linear_velocity;
+        pa_pos += es->linear_offset * rel_vel * (2. - rel_vel);
+    } else {
+        pa_pos += es->linear_offset;
+    }
+    return m->start_pos.x + pa_pos;
 }
 
 void __visible
 extruder_set_pressure_advance(struct stepper_kinematics *sk
-                              , double pressure_advance, double smooth_time)
+                              , double linear_velocity, double linear_offset
+                              , double linear_advance, double smooth_time)
 {
     struct extruder_stepper *es = container_of(sk, struct extruder_stepper, sk);
     double hst = smooth_time * .5;
@@ -149,7 +159,14 @@ extruder_set_pressure_advance(struct stepper_kinematics *sk
     if (! hst)
         return;
     es->inv_half_smooth_time2 = 1. / (hst * hst);
-    es->pressure_advance = pressure_advance;
+    es->linear_advance = linear_advance;
+    if (linear_velocity > 0.) {
+        es->linear_velocity = linear_velocity;
+        es->linear_offset = linear_offset;
+    } else {
+        es->linear_velocity = 0.;
+        es->linear_offset = 0.;
+    }
 }
 
 struct stepper_kinematics * __visible
