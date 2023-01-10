@@ -149,7 +149,8 @@ shaper_pa_range_integrate(struct move *m, int axis, double move_time
 struct extruder_stepper {
     struct stepper_kinematics sk;
     struct shaper_pulses sp[3];
-    double pressure_advance, half_smooth_time, inv_half_smooth_time2;
+    double linear_velocity, linear_offset, linear_advance;
+    double half_smooth_time, inv_half_smooth_time2;
 };
 
 static double
@@ -183,9 +184,16 @@ extruder_calc_position(struct stepper_kinematics *sk, struct move *m
         }
     }
     double position = e_pos.x + e_pos.y + e_pos.z;
+    if (!hst)
+        return position;
     double pa_velocity = pa_vel.x + pa_vel.y + pa_vel.z;
-    if (hst) {
-        position += es->pressure_advance * pa_velocity;
+    if (pa_velocity < 0.) pa_velocity = 0.;
+    position += es->linear_advance * pa_velocity;
+    if (pa_velocity < es->linear_velocity) {
+        double rel_vel = pa_velocity / es->linear_velocity;
+        position += es->linear_offset * rel_vel * (2. - rel_vel);
+    } else {
+        position += es->linear_offset;
     }
     return position;
 }
@@ -213,18 +221,24 @@ extruder_note_generation_time(struct extruder_stepper *es)
 
 void __visible
 extruder_set_pressure_advance(struct stepper_kinematics *sk
-                              , double pressure_advance, double smooth_time)
+                              , double linear_velocity, double linear_offset
+                              , double linear_advance, double smooth_time)
 {
     struct extruder_stepper *es = container_of(sk, struct extruder_stepper, sk);
     double hst = smooth_time * .5;
     es->half_smooth_time = hst;
     extruder_note_generation_time(es);
-    if (! hst) {
-        es->pressure_advance = 0.;
+    if (! hst)
         return;
-    }
     es->inv_half_smooth_time2 = 1. / (hst * hst);
-    es->pressure_advance = pressure_advance;
+    es->linear_advance = linear_advance;
+    if (linear_velocity > 0.) {
+        es->linear_velocity = linear_velocity;
+        es->linear_offset = linear_offset;
+    } else {
+        es->linear_velocity = 0.;
+        es->linear_offset = 0.;
+    }
 }
 
 int __visible
