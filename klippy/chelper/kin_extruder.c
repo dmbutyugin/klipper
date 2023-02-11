@@ -119,7 +119,7 @@ pa_range_integrate(struct move *m, double move_time, double hst
 
 struct extruder_stepper {
     struct stepper_kinematics sk;
-    double linear_velocity, linear_offset, linear_advance;
+    double v0, linear_offset, linear_advance;
     double half_smooth_time, inv_half_smooth_time2;
 };
 
@@ -137,13 +137,9 @@ extruder_calc_position(struct stepper_kinematics *sk, struct move *m
     pa_range_integrate(m, move_time, hst, &pa_pos, &pa_velocity);
     pa_pos *= es->inv_half_smooth_time2;
     pa_velocity *= es->inv_half_smooth_time2;
-    pa_pos += es->linear_advance * pa_velocity;
-    if (pa_velocity < 0.) pa_velocity = 0.;
-    if (pa_velocity < es->linear_velocity) {
-        double rel_vel = pa_velocity / es->linear_velocity;
-        pa_pos += es->linear_offset * (2. * sqrt(rel_vel) - rel_vel);
-    } else {
-        pa_pos += es->linear_offset;
+    if (pa_velocity > 0.) {
+        pa_pos += es->linear_advance * pa_velocity;
+        pa_pos += es->linear_offset * exp(-es->v0 / pa_velocity);
     }
     return m->start_pos.x + pa_pos;
 }
@@ -161,12 +157,14 @@ extruder_set_pressure_advance(struct stepper_kinematics *sk
         return;
     es->inv_half_smooth_time2 = 1. / (hst * hst);
     es->linear_advance = linear_advance;
-    if (linear_velocity > 0.) {
-        es->linear_velocity = linear_velocity;
+    if (linear_velocity > 0. &&
+            linear_advance * linear_velocity < linear_offset) {
         es->linear_offset = linear_offset;
+        es->v0 = -linear_velocity *
+                  log(1. - linear_advance * linear_velocity / linear_offset);
     } else {
-        es->linear_velocity = 0.;
         es->linear_offset = 0.;
+        es->v0 = 0.;
     }
 }
 
