@@ -120,7 +120,7 @@ pa_range_integrate(struct move *m, double move_time, double hst
 struct extruder_stepper {
     struct stepper_kinematics sk;
     double v0, linear_offset, linear_advance;
-    double half_smooth_time, inv_half_smooth_time2;
+    double offset_time, half_smooth_time, inv_half_smooth_time2;
 };
 
 static double
@@ -128,6 +128,15 @@ extruder_calc_position(struct stepper_kinematics *sk, struct move *m
                        , double move_time)
 {
     struct extruder_stepper *es = container_of(sk, struct extruder_stepper, sk);
+    move_time += es->offset_time;
+    while (unlikely(move_time < 0.)) {
+        m = list_prev_entry(m, node);
+        move_time += m->move_t;
+    }
+    while (unlikely(move_time >= m->move_t)) {
+        move_time -= m->move_t;
+        m = list_next_entry(m, node);
+    }
     double hst = es->half_smooth_time;
     if (!hst)
         // Pressure advance not enabled
@@ -147,12 +156,15 @@ extruder_calc_position(struct stepper_kinematics *sk, struct move *m
 void __visible
 extruder_set_pressure_advance(struct stepper_kinematics *sk
                               , double linear_velocity, double linear_offset
-                              , double linear_advance, double smooth_time)
+                              , double linear_advance, double smooth_time
+                              , double offset_time)
 {
     struct extruder_stepper *es = container_of(sk, struct extruder_stepper, sk);
     double hst = smooth_time * .5;
     es->half_smooth_time = hst;
-    es->sk.gen_steps_pre_active = es->sk.gen_steps_post_active = hst;
+    es->offset_time = offset_time;
+    es->sk.gen_steps_pre_active = hst > -offset_time ? hst + offset_time : 0.0;
+    es->sk.gen_steps_post_active = hst > offset_time ? hst - offset_time : 0.0;
     if (! hst)
         return;
     es->inv_half_smooth_time2 = 1. / (hst * hst);
