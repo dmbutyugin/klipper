@@ -151,7 +151,7 @@ struct extruder_stepper {
     struct stepper_kinematics sk;
     struct shaper_pulses sp[3];
     double v0, linear_offset, linear_advance;
-    double half_smooth_time, inv_half_smooth_time2;
+    double offset_time, half_smooth_time, inv_half_smooth_time2;
 };
 
 static double
@@ -159,6 +159,15 @@ extruder_calc_position(struct stepper_kinematics *sk, struct move *m
                        , double move_time)
 {
     struct extruder_stepper *es = container_of(sk, struct extruder_stepper, sk);
+    move_time += es->offset_time;
+    while (unlikely(move_time < 0.)) {
+        m = list_prev_entry(m, node);
+        move_time += m->move_t;
+    }
+    while (unlikely(move_time >= m->move_t)) {
+        move_time -= m->move_t;
+        m = list_next_entry(m, node);
+    }
     double hst = es->half_smooth_time;
     int i;
     struct coord e_pos, pa_vel;
@@ -209,8 +218,10 @@ extruder_note_generation_time(struct extruder_stepper *es)
             ? -sp->pulses[0].t : post_active;
     }
     if (es->half_smooth_time) {
-        pre_active += es->half_smooth_time;
-        post_active += es->half_smooth_time;
+        pre_active += es->half_smooth_time + es->offset_time;
+        if (pre_active < 0.) pre_active = 0.;
+        post_active += es->half_smooth_time - es->offset_time;
+        if (post_active < 0.) post_active = 0.;
     }
     es->sk.gen_steps_pre_active = pre_active;
     es->sk.gen_steps_post_active = post_active;
@@ -219,11 +230,13 @@ extruder_note_generation_time(struct extruder_stepper *es)
 void __visible
 extruder_set_pressure_advance(struct stepper_kinematics *sk
                               , double linear_velocity, double linear_offset
-                              , double linear_advance, double smooth_time)
+                              , double linear_advance, double smooth_time
+                              , double offset_time)
 {
     struct extruder_stepper *es = container_of(sk, struct extruder_stepper, sk);
     double hst = smooth_time * .5;
     es->half_smooth_time = hst;
+    es->offset_time = offset_time;
     extruder_note_generation_time(es);
     if (! hst)
         return;

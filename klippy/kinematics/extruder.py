@@ -12,6 +12,7 @@ class ExtruderStepper:
         self.name = config.get_name().split()[-1]
         self.linear_advance = self.linear_velocity = self.linear_offset = 0.
         self.pressure_advance_smooth_time = 0.
+        self.pressure_advance_offset_time = 0.
         self.input_shaper_step_gen_window = 0.
         config_pa = config.getfloat('pressure_advance', None, minval=0.)
         if config_pa is not None:
@@ -25,6 +26,8 @@ class ExtruderStepper:
                                                     else -1.))
         self.config_smooth_time = config.getfloat(
                 'pressure_advance_smooth_time', 0.040, above=0., maxval=.200)
+        self.config_offset_time = config.getfloat(
+                'pressure_advance_offset_time', 0.0, minval=-0.2, maxval=0.2)
         # Setup stepper
         self.stepper = stepper.PrinterStepper(config)
         ffi_main, ffi_lib = chelper.get_ffi()
@@ -62,12 +65,14 @@ class ExtruderStepper:
         if input_shaper:
             input_shaper.add_extruder(self)
         self._set_pressure_advance(self.config_lv, self.config_lo,
-                                   self.config_la, self.config_smooth_time)
+                                   self.config_la, self.config_smooth_time,
+                                   self.config_offset_time)
     def get_status(self, eventtime):
         return {'pressure_advance': self.linear_advance,
                 'linear_velocity': self.linear_velocity,
                 'linear_offset': self.linear_offset,
                 'smooth_time': self.pressure_advance_smooth_time,
+                'offset_time': self.pressure_advance_offset_time,
                 'motion_queue': self.motion_queue}
     def find_past_position(self, print_time):
         mcu_pos = self.stepper.get_past_mcu_position(print_time)
@@ -87,26 +92,29 @@ class ExtruderStepper:
         self.stepper.set_trapq(extruder.get_trapq())
         self.motion_queue = extruder_name
     def _set_pressure_advance(self, linear_velocity, linear_offset,
-                              linear_advance, smooth_time):
+                              linear_advance, smooth_time, offset_time):
         old_smooth_time = self.pressure_advance_smooth_time
         if not self.linear_advance and not self.linear_offset:
             old_smooth_time = 0.
+        old_offset_time = self.pressure_advance_offset_time
         new_smooth_time = smooth_time
         if not linear_advance and not linear_offset:
             new_smooth_time = 0.
         is_step_gen_window = self.input_shaper_step_gen_window
         toolhead = self.printer.lookup_object("toolhead")
         toolhead.note_step_generation_scan_time(
-                new_smooth_time * .5 + is_step_gen_window,
-                old_delay=old_smooth_time * .5 + is_step_gen_window)
+                new_smooth_time*.5 + abs(offset_time) + is_step_gen_window,
+                old_delay=(old_smooth_time*.5 + abs(old_offset_time) +
+                           is_step_gen_window))
         ffi_main, ffi_lib = chelper.get_ffi()
         espa = ffi_lib.extruder_set_pressure_advance
         espa(self.sk_extruder, linear_velocity, linear_offset, linear_advance,
-             new_smooth_time)
+             new_smooth_time, offset_time)
         self.linear_velocity = linear_velocity
         self.linear_offset = linear_offset
         self.linear_advance = linear_advance
         self.pressure_advance_smooth_time = smooth_time
+        self.pressure_advance_offset_time = offset_time
     def update_input_shaping(self, axis_shaper, input_shaper_step_gen_window):
         smooth_time = self.pressure_advance_smooth_time
         if not self.linear_advance and not self.linear_offset:
@@ -140,12 +148,17 @@ class ExtruderStepper:
         smooth_time = gcmd.get_float('SMOOTH_TIME',
                                      self.pressure_advance_smooth_time,
                                      minval=0., maxval=.200)
+        offset_time = gcmd.get_float('OFFSET_TIME',
+                                     self.pressure_advance_offset_time,
+                                     minval=-0.2, maxval=0.2)
         pressure_advance = gcmd.get_float('ADVANCE', None, minval=0.)
         if pressure_advance is not None:
-            self._set_pressure_advance(0., 0., pressure_advance, smooth_time)
+            self._set_pressure_advance(
+                    0., 0., pressure_advance, smooth_time, offset_time)
             msg = ("pressure_advance: %.6f\n"
-                   "pressure_advance_smooth_time: %.6f"
-                   % (pressure_advance, smooth_time))
+                   "pressure_advance_smooth_time: %.6f\n"
+                   "pressure_advance_offset_time: %.6f"
+                   % (pressure_advance, smooth_time, offset_time))
         else:
             linear_advance = gcmd.get_float('LINEAR_ADVANCE',
                                             self.linear_advance, minval=0.)
@@ -157,13 +170,14 @@ class ExtruderStepper:
                 raise gcmd.error('LINEAR_VELOCITY must be set to a positive '
                                  'value when LINEAR_OFFSET is configured')
             self._set_pressure_advance(linear_velocity, linear_offset,
-                                       linear_advance, smooth_time)
+                                       linear_advance, smooth_time, offset_time)
             msg = ("linear_advance: %.6f\n"
                    "linear_velocity: %.6f\n"
                    "linear_offset: %.6f\n"
-                   "pressure_advance_smooth_time: %.6f"
+                   "pressure_advance_smooth_time: %.6f\n"
+                   "pressure_advance_offset_time: %.6f"
                    % (linear_advance, linear_velocity, linear_offset,
-                      smooth_time))
+                      smooth_time, offset_time))
         self.printer.set_rollover_info(self.name, "%s: %s" % (self.name, msg))
         gcmd.respond_info(msg, log=False)
     cmd_SET_E_ROTATION_DISTANCE_help = "Set extruder rotation distance"
