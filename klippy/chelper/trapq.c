@@ -24,7 +24,7 @@ move_alloc(void)
 inline double
 move_get_distance(struct move *m, double move_time)
 {
-    return (m->start_v + m->half_accel * move_time) * move_time;
+    return scurve_eval(&m->s, move_time);
 }
 
 // Return the XYZ coordinates given a time in a move
@@ -117,11 +117,13 @@ trapq_add_move(struct trapq *tq, struct move *m)
 
 // Fill and add a move to the trapezoid velocity queue
 void __visible
-trapq_append(struct trapq *tq, double print_time
-             , double accel_t, double cruise_t, double decel_t
+trapq_append(struct trapq *tq, double print_time, int accel_order
+             , double accel_t, double accel_offset_t, double total_accel_t
+             , double cruise_t
+             , double decel_t, double decel_offset_t, double total_decel_t
              , double start_pos_x, double start_pos_y, double start_pos_z
              , double axes_r_x, double axes_r_y, double axes_r_z
-             , double start_v, double cruise_v, double accel)
+             , double start_accel_v, double cruise_v, double accel)
 {
     struct coord start_pos = { .x=start_pos_x, .y=start_pos_y, .z=start_pos_z };
     struct coord axes_r = { .x=axes_r_x, .y=axes_r_y, .z=axes_r_z };
@@ -129,8 +131,8 @@ trapq_append(struct trapq *tq, double print_time
         struct move *m = move_alloc();
         m->print_time = print_time;
         m->move_t = accel_t;
-        m->start_v = start_v;
-        m->half_accel = .5 * accel;
+        scurve_fill(&m->s, accel_order, accel_t, accel_offset_t, total_accel_t
+                    , start_accel_v, accel);
         m->start_pos = start_pos;
         m->axes_r = axes_r;
         trapq_add_move(tq, m);
@@ -142,8 +144,7 @@ trapq_append(struct trapq *tq, double print_time
         struct move *m = move_alloc();
         m->print_time = print_time;
         m->move_t = cruise_t;
-        m->start_v = cruise_v;
-        m->half_accel = 0.;
+        scurve_fill(&m->s, 2, cruise_t, 0., cruise_t, cruise_v, 0.);
         m->start_pos = start_pos;
         m->axes_r = axes_r;
         trapq_add_move(tq, m);
@@ -155,8 +156,8 @@ trapq_append(struct trapq *tq, double print_time
         struct move *m = move_alloc();
         m->print_time = print_time;
         m->move_t = decel_t;
-        m->start_v = cruise_v;
-        m->half_accel = -.5 * accel;
+        scurve_fill(&m->s, accel_order, decel_t, decel_offset_t, total_decel_t
+                    , cruise_v, -accel);
         m->start_pos = start_pos;
         m->axes_r = axes_r;
         trapq_add_move(tq, m);
@@ -181,7 +182,7 @@ trapq_finalize_moves(struct trapq *tq, double print_time)
         if (m->print_time + m->move_t > print_time)
             break;
         list_del(&m->node);
-        if (m->start_v || m->half_accel)
+        if (m->s.c1 || m->s.c2 || m->s.c3 || m->s.c4 || m->s.c5 || m->s.c6)
             list_add_head(&m->node, &tq->history);
         else
             free(m);
@@ -243,8 +244,8 @@ trapq_extract_old(struct trapq *tq, struct pull_move *p, int max
             continue;
         p->print_time = m->print_time;
         p->move_t = m->move_t;
-        p->start_v = m->start_v;
-        p->accel = 2. * m->half_accel;
+        p->start_v = scurve_velocity(&m->s, 0.);
+        p->accel = (scurve_velocity(&m->s, m->move_t) - p->start_v) / m->move_t;
         p->start_x = m->start_pos.x;
         p->start_y = m->start_pos.y;
         p->start_z = m->start_pos.z;

@@ -61,8 +61,8 @@ class ManualStepper:
         dist = movepos - cp
         axis_r, accel_t, cruise_t, cruise_v = force_move.calc_move_time(
             dist, speed, accel)
-        self.trapq_append(self.trapq, self.next_cmd_time,
-                          accel_t, cruise_t, accel_t,
+        self.trapq_append(self.trapq, self.next_cmd_time, 2,
+                          accel_t, 0., accel_t, cruise_t, accel_t, 0., accel_t,
                           cp, 0., 0., axis_r, 0., 0.,
                           0., cruise_v, accel)
         self.next_cmd_time = self.next_cmd_time + accel_t + cruise_t + accel_t
