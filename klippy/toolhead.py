@@ -17,6 +17,7 @@ class Move:
         self.start_pos = tuple(start_pos)
         self.end_pos = tuple(end_pos)
         self.accel = toolhead.max_accel
+        self.accel_order = toolhead.accel_order
         self.junction_deviation = toolhead.junction_deviation
         self.timing_callbacks = []
         velocity = min(speed, toolhead.max_velocity)
@@ -93,8 +94,8 @@ class Move:
     def set_junction(self, start_v2, cruise_v2, end_v2):
         # Determine accel, cruise, and decel portions of the move distance
         half_inv_accel = .5 / self.accel
-        accel_d = (cruise_v2 - start_v2) * half_inv_accel
-        decel_d = (cruise_v2 - end_v2) * half_inv_accel
+        self.accel_d = accel_d = (cruise_v2 - start_v2) * half_inv_accel
+        self.decel_d = decel_d = (cruise_v2 - end_v2) * half_inv_accel
         cruise_d = self.move_d - accel_d - decel_d
         # Determine move velocities
         self.start_v = start_v = math.sqrt(start_v2)
@@ -105,6 +106,12 @@ class Move:
         self.accel_t = accel_d / ((start_v + cruise_v) * 0.5)
         self.cruise_t = cruise_d / cruise_v
         self.decel_t = decel_d / ((end_v + cruise_v) * 0.5)
+        if self.cruise_t < 0.0000000001:
+            self.cruise_t = 0.
+        self.total_accel_t = self.accel_t
+        self.total_decel_t = self.decel_t
+        self.accel_offset_t = self.decel_offset_t = 0.
+        self.start_accel_v = self.start_v
 
 LOOKAHEAD_FLUSH_TIME = 0.250
 
@@ -115,6 +122,10 @@ class MoveQueue:
         self.toolhead = toolhead
         self.queue = []
         self.junction_flush = LOOKAHEAD_FLUSH_TIME
+        ffi_main, ffi_lib = chelper.get_ffi()
+        self.s = ffi_main.gc(ffi_lib.scurve_alloc(), ffi_lib.free)
+        self.scurve_fill = ffi_lib.scurve_fill
+        self.scurve_get_time = ffi_lib.scurve_get_time
     def reset(self):
         del self.queue[:]
         self.junction_flush = LOOKAHEAD_FLUSH_TIME
@@ -172,10 +183,55 @@ class MoveQueue:
             next_smoothed_v2 = smoothed_v2
         if update_flush_count or not flush_count:
             return
+        self.join_accels_decels(queue[:flush_count])
         # Generate step times for all moves ready to be flushed
         self.toolhead._process_moves(queue[:flush_count])
         # Remove processed moves from the queue
         del queue[:flush_count]
+    def join_accels_decels(self, moves):
+        joined_accel = []
+        joined_decel = []
+        scurve_fill = self.scurve_fill
+        scurve_get_time = self.scurve_get_time
+        for move in moves:
+            if joined_decel and (move.accel_t or move.cruise_t
+                                 or move.accel != joined_decel[0].accel):
+                total_decel_t = decel_offset_t = pos = 0.
+                for m in joined_decel:
+                    total_decel_t += m.decel_t
+                first = joined_decel[0]
+                start_decel_v = first.cruise_v
+                scurve_fill(self.s, first.accel_order, total_decel_t, 0.,
+                            total_decel_t, start_decel_v, -first.accel)
+                for m in joined_decel:
+                    m.total_decel_t = total_decel_t
+                    m.decel_offset_t = decel_offset_t
+                    m.cruise_v = start_decel_v
+                    pos += m.decel_d
+                    m.decel_t = scurve_get_time(self.s, pos) - decel_offset_t
+                    decel_offset_t += m.decel_t
+                del(joined_decel[:])
+            if move.accel_t:
+                joined_accel.append(move)
+            if joined_accel and (move.decel_t or move.cruise_t
+                                 or move.accel != joined_accel[0].accel):
+                total_accel_t = accel_offset_t = pos = 0.
+                for m in joined_accel:
+                    total_accel_t += m.accel_t
+                first = joined_accel[0]
+                start_accel_v = joined_accel[0].start_v
+                self.scurve_fill(self.s, first.accel_order, total_accel_t, 0.,
+                                 total_accel_t, start_accel_v, first.accel)
+                for m in joined_accel:
+                    m.total_accel_t = total_accel_t
+                    m.accel_offset_t = accel_offset_t
+                    m.start_accel_v = start_accel_v
+                    pos += m.accel_d
+                    m.accel_t = scurve_get_time(self.s, pos) - accel_offset_t
+                    accel_offset_t += m.accel_t
+                del(joined_accel[:])
+            if move.decel_t:
+                joined_decel.append(move)
     def add_move(self, move):
         self.queue.append(move)
         if len(self.queue) == 1:
@@ -211,6 +267,8 @@ class ToolHead:
         self.printer.register_event_handler("klippy:shutdown",
                                             self._handle_shutdown)
         # Velocity and acceleration control
+        self.accel_order = config.getchoice(
+                'acceleration_order', { "2": 2, "4": 4, "6": 6 }, "2")
         self.max_velocity = config.getfloat('max_velocity', above=0.)
         self.max_accel = config.getfloat('max_accel', above=0.)
         self.requested_accel_to_decel = config.getfloat(
@@ -270,6 +328,8 @@ class ToolHead:
                                self.cmd_SET_VELOCITY_LIMIT,
                                desc=self.cmd_SET_VELOCITY_LIMIT_help)
         gcode.register_command('M204', self.cmd_M204)
+        gcode.register_command('SET_SCURVE', self.cmd_SET_SCURVE,
+                               desc=self.cmd_SET_SCURVE_help)
         # Load some default modules
         modules = ["gcode_move", "homing", "idle_timeout", "statistics",
                    "manual_probe", "tuning_tower"]
@@ -317,13 +377,13 @@ class ToolHead:
         for move in moves:
             if move.is_kinematic_move:
                 self.trapq_append(
-                    self.trapq, next_move_time, 2,
-                    move.accel_t, 0., move.accel_t,
+                    self.trapq, next_move_time, move.accel_order,
+                    move.accel_t, move.accel_offset_t, move.total_accel_t,
                     move.cruise_t,
-                    move.decel_t, 0., move.decel_t,
+                    move.decel_t, move.decel_offset_t, move.total_decel_t,
                     move.start_pos[0], move.start_pos[1], move.start_pos[2],
                     move.axes_r[0], move.axes_r[1], move.axes_r[2],
-                    move.start_v, move.cruise_v, move.accel)
+                    move.start_accel_v, move.cruise_v, move.accel)
             if move.axes_d[3]:
                 self.extruder.move(next_move_time, move)
             next_move_time = (next_move_time + move.accel_t
@@ -603,6 +663,18 @@ class ToolHead:
             accel = min(p, t)
         self.max_accel = accel
         self._calc_junction_deviation()
+    cmd_SET_SCURVE_help = "Set S-Curve parameters"
+    def cmd_SET_SCURVE(self, gcmd):
+        accel_order = gcmd.get_int(
+            'ACCEL_ORDER', self.accel_order, minval=2, maxval=6)
+        if accel_order not in [2, 4, 6]:
+            raise gcmd.error(
+                    "ACCEL_ORDER = %s is not a valid choice" % (accel_order,))
+        self._flush_lookahead()
+        self.accel_order = accel_order
+        msg = "accel_order: %d" % (accel_order, )
+        self.printer.set_rollover_info("toolhead", "toolhead: %s" % (msg,))
+        gcmd.respond_info(msg, log=False)
 
 def add_printer_objects(config):
     config.get_printer().add_object('toolhead', ToolHead(config))

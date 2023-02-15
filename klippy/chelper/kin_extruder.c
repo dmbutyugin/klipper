@@ -58,11 +58,14 @@ pa_move_integrate(struct move *m, double pressure_advance
     if (end > m->move_t)
         end = m->move_t;
     double extrude_pos = base;
-    struct scurve s = m->s;
+    double extrude_r = m->axes_r.x;
+    struct scurve s;
+    scurve_copy_scaled(&m->s, extrude_r, &s);
     // Calculate base position and velocity with pressure advance
     int can_pressure_advance = m->axes_r.y != 0.;
     if (can_pressure_advance)
-        extrude_pos += scurve_add_deriv(&m->s, pressure_advance, &s);
+        extrude_pos += scurve_add_deriv(
+                &m->s, extrude_r * pressure_advance, &s);
     // Calculate definitive integral
     double iext = extruder_integrate(extrude_pos, &s, start, end);
     double wgt_ext = extruder_integrate_time(extrude_pos, &s, start, end);
@@ -111,7 +114,7 @@ extruder_calc_position(struct stepper_kinematics *sk, struct move *m
     double hst = es->half_smooth_time;
     if (!hst)
         // Pressure advance not enabled
-        return m->start_pos.x + move_get_distance(m, move_time);
+        return m->start_pos.x + m->axes_r.x * move_get_distance(m, move_time);
     // Apply pressure advance and average over smooth_time
     double area = pa_range_integrate(m, move_time, es->pressure_advance, hst);
     return m->start_pos.x + area * es->inv_half_smooth_time2;

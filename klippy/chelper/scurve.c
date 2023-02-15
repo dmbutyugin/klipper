@@ -6,6 +6,7 @@
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
 #include <math.h> // fabs
+#include <stdlib.h> // malloc
 #include <string.h> // memset
 
 #include "compiler.h" // likely
@@ -80,13 +81,14 @@ scurve_fill_bezier6(struct scurve *s, double start_accel_v
     scurve_offset(s, accel_offset_t);
 }
 
-double scurve_get_time(const struct scurve *s, double distance)
+double __visible
+scurve_get_time(const struct scurve *s, double distance)
 {
     double low = 0;
     double high = s->total_accel_t;
     if (scurve_eval(s, high) <= distance) return high;
     if (scurve_eval(s, low) > distance) return low;
-    while (likely(high - low > .000000001)) {
+    while (likely(high - low > .0000000001)) {
         double guess_time = (high + low) * .5;
         if (scurve_eval(s, guess_time) > distance) {
             high = guess_time;
@@ -97,7 +99,7 @@ double scurve_get_time(const struct scurve *s, double distance)
     return (high + low) * .5;
 }
 
-void
+void __visible
 scurve_fill(struct scurve *s, int accel_order
             , double accel_t, double accel_offset_t, double total_accel_t
             , double start_accel_v, double effective_accel)
@@ -210,4 +212,12 @@ scurve_tn_integrate(const struct scurve *s, int n, double start, double end)
     sum = sum * start + e_n;
     avg_val += coeffs[6] * s->c6 * sum;
     return delta_t * avg_val;
+}
+
+struct scurve * __visible
+scurve_alloc(void)
+{
+    struct scurve *s = malloc(sizeof(*s));
+    memset(s, 0, sizeof(*s));
+    return s;
 }

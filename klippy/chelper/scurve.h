@@ -23,5 +23,6 @@ void scurve_fill(struct scurve *s, int accel_order
                  , double accel_t, double accel_offset_t, double total_accel_t
                  , double start_accel_v, double effective_accel);
 double scurve_get_time(const struct scurve *s, double distance);
+struct scurve * scurve_alloc(void);
 
 #endif // scurve.h
