@@ -4,6 +4,7 @@
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
+#include <math.h> // tanh
 #include <stddef.h> // offsetof
 #include <stdlib.h> // malloc
 #include <string.h> // memset
@@ -149,7 +150,7 @@ shaper_pa_range_integrate(struct move *m, int axis, double move_time
 struct extruder_stepper {
     struct stepper_kinematics sk;
     struct shaper_pulses sp[3];
-    double linear_velocity, linear_offset, linear_advance;
+    double v0, linear_offset, linear_advance;
     double half_smooth_time, inv_half_smooth_time2;
 };
 
@@ -187,13 +188,9 @@ extruder_calc_position(struct stepper_kinematics *sk, struct move *m
     if (!hst)
         return position;
     double pa_velocity = pa_vel.x + pa_vel.y + pa_vel.z;
-    if (pa_velocity < 0.) pa_velocity = 0.;
-    position += es->linear_advance * pa_velocity;
-    if (pa_velocity < es->linear_velocity) {
-        double rel_vel = pa_velocity / es->linear_velocity;
-        position += es->linear_offset * rel_vel * (2. - rel_vel);
-    } else {
-        position += es->linear_offset;
+    if (pa_velocity > 0.) {
+        position += es->linear_advance * pa_velocity;
+        position += es->linear_offset * tanh(pa_velocity / es->v0);
     }
     return position;
 }
@@ -232,12 +229,14 @@ extruder_set_pressure_advance(struct stepper_kinematics *sk
         return;
     es->inv_half_smooth_time2 = 1. / (hst * hst);
     es->linear_advance = linear_advance;
-    if (linear_velocity > 0.) {
-        es->linear_velocity = linear_velocity;
+    if (linear_velocity > 0. &&
+            linear_advance * linear_velocity < linear_offset) {
         es->linear_offset = linear_offset;
+        es->v0 = linear_velocity / atanh(
+                1. - .25 * linear_advance * linear_velocity / linear_offset);
     } else {
-        es->linear_velocity = 0.;
         es->linear_offset = 0.;
+        es->v0 = 0.;
     }
 }
 
