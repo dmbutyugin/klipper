@@ -47,6 +47,7 @@ class Move:
         self.delta_v2 = 2.0 * move_d * self.accel
         self.max_smoothed_v2 = 0.
         self.smooth_delta_v2 = 2.0 * move_d * toolhead.max_accel_to_decel
+        self.junction_v2 = 999999999.9
     def limit_speed(self, speed, accel):
         speed2 = speed**2
         if speed2 < self.max_cruise_v2:
@@ -55,6 +56,8 @@ class Move:
         self.accel = min(self.accel, accel)
         self.delta_v2 = 2.0 * self.move_d * self.accel
         self.smooth_delta_v2 = min(self.smooth_delta_v2, self.delta_v2)
+    def limit_junction(self, junction_v2):
+        self.junction_v2 = min(self.junction_v2, junction_v2)
     def move_error(self, msg="Move out of range"):
         ep = self.end_pos
         m = "%s: %.3f %.3f %.3f [%.3f]" % (msg, ep[0], ep[1], ep[2], ep[3])
@@ -75,7 +78,7 @@ class Move:
         # Apply limits
         self.max_start_v2 = min(
             extruder_v2, self.max_cruise_v2, prev_move.max_cruise_v2,
-            prev_move.max_start_v2 + prev_move.delta_v2)
+            self.junction_v2, prev_move.max_start_v2 + prev_move.delta_v2)
         if junction_cos_theta >= -0.999999:
             sin_theta_d2 = math.sqrt(0.5*(1.0-junction_cos_theta))
             R_jd = sin_theta_d2 / (1. - sin_theta_d2)
@@ -463,7 +466,7 @@ class ToolHead:
         self.commanded_pos[:] = newpos
         self.kin.set_position(newpos, homing_axes)
         self.printer.send_event("toolhead:set_position")
-    def move(self, newpos, speed):
+    def move(self, newpos, speed, max_junction_v2=None):
         move = Move(self, self.commanded_pos, newpos, speed)
         if not move.move_d:
             return
@@ -471,6 +474,8 @@ class ToolHead:
             self.kin.check_move(move)
         if move.axes_d[3]:
             self.extruder.check_move(move)
+        if max_junction_v2 is not None:
+            move.limit_junction(max_junction_v2)
         self.commanded_pos[:] = move.end_pos
         self.lookahead.add_move(move)
         if self.print_time > self.need_check_pause:
