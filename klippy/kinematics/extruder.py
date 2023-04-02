@@ -60,7 +60,7 @@ class ExtruderStepper:
         if extruder is None or not isinstance(extruder, PrinterExtruder):
             raise self.printer.command_error("'%s' is not a valid extruder."
                                              % (extruder_name,))
-        self.stepper.set_position([extruder.last_position, 0., 0.])
+        self.stepper.set_position(extruder.last_position)
         self.stepper.set_trapq(extruder.get_trapq())
         self.motion_queue = extruder_name
     def _set_pressure_advance(self, pressure_advance, smooth_time):
@@ -136,7 +136,7 @@ class PrinterExtruder:
     def __init__(self, config, extruder_num):
         self.printer = config.get_printer()
         self.name = config.get_name()
-        self.last_position = 0.
+        self.last_position = [0., 0., 0.]
         # Setup hotend heater
         pheaters = self.printer.load_object(config, 'heaters')
         gcode_id = 'T%d' % (extruder_num,)
@@ -236,19 +236,25 @@ class PrinterExtruder:
         return move.max_cruise_v2
     def process_move(self, print_time, move, ea_index):
         axis_r = move.axes_r[ea_index]
-        accel = move.accel * axis_r
-        start_v = move.start_v * axis_r
-        cruise_v = move.cruise_v * axis_r
-        can_pressure_advance = False
-        if axis_r > 0. and (move.axes_d[0] or move.axes_d[1]):
-            can_pressure_advance = True
-        # Queue movement (x is extruder movement, y is pressure advance flag)
+        abs_axis_r = abs(axis_r)
+        accel = move.accel * abs_axis_r
+        start_v = move.start_v * abs_axis_r
+        cruise_v = move.cruise_v * abs_axis_r
+        extr_pos = self.last_position
+        if move.is_kinematic_move:
+            # Regular kinematic move with extrusion
+            extr_r = [math.copysign(r * r, axis_r) for r in move.axes_r[:3]]
+        else:
+            # Extrude-only move, do not apply pressure advance
+            extr_r = [0., 0., axis_r]
         self.trapq_append(self.trapq, print_time,
                           move.accel_t, move.cruise_t, move.decel_t,
-                          move.start_pos[ea_index], 0., 0.,
-                          1., can_pressure_advance, 0.,
+                          extr_pos[0], extr_pos[1], extr_pos[2],
+                          extr_r[0], extr_r[1], extr_r[2],
                           start_v, cruise_v, accel)
-        self.last_position = move.end_pos[ea_index]
+        extr_d = abs(move.axes_d[ea_index])
+        for i in range(3):
+            self.last_position[i] += extr_d * extr_r[i]
     def find_past_position(self, print_time):
         if self.extruder_stepper is None:
             return 0.
@@ -281,7 +287,7 @@ class PrinterExtruder:
             return
         gcmd.respond_info("Activating extruder %s" % (self.name,))
         toolhead.flush_step_generation()
-        toolhead.set_extruder(self, self.last_position)
+        toolhead.set_extruder(self, sum(self.last_position))
         self.printer.send_event("extruder:activate_extruder")
 
 # Dummy extruder class used when a printer has no extruder at all
