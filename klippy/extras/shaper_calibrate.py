@@ -41,10 +41,13 @@ class CalibrationData:
     def set_numpy(self, numpy):
         self.numpy = numpy
     def normalize_to_frequencies(self):
-        freq_bins = self.freq_bins
         for psd in self._psd_list:
-            # Avoid division by zero errors and remove low-frequency noise
-            psd *= self.numpy.tanh(.5 / MIN_FREQ * freq_bins) / (freq_bins + .1)
+            # Avoid division by zero errors
+            psd /= self.freq_bins + .1
+            # Remove low-frequency noise
+            low_freqs = self.freq_bins < 2. * MIN_FREQ
+            psd[low_freqs] *= self.numpy.exp(
+                    -(2. * MIN_FREQ / (self.freq_bins[low_freqs] + .1))**2 + 1.)
     def get_psd(self, axis='all'):
         return self._psd_map[axis]
 
