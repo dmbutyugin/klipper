@@ -10,6 +10,13 @@ class ExtruderSmoother:
     def __init__(self, config, pa_model):
         self.smooth_time = config.getfloat(
                 'pressure_advance_smooth_time', 0.040, above=0., maxval=.200)
+        self.smooth_extruding_moves = config.getboolean(
+                'pressure_advance_smooth_extruding_moves', True)
+        self.smooth_extrude_only_moves = config.getboolean(
+                'pressure_advance_smooth_extrude_only_moves', True)
+        if self.smooth_extrude_only_moves and not self.smooth_extruding_moves:
+            raise config.error("Cannot smooth non-extrude moves when smoothing "
+                               "for extrude moves is disabled")
         # A 4-th order smoothing function that goes to 0 together with
         # its derivative at the ends of the smoothing interval
         self.a = [15./8., 0., -15., 0., 30.]
@@ -18,7 +25,20 @@ class ExtruderSmoother:
     def update(self, gcmd):
         old_smooth_time = self.smooth_time
         self.smooth_time = gcmd.get_float('SMOOTH_TIME', self.smooth_time)
-        return self.smooth_time != old_smooth_time
+        old_smooth_extruding_moves = self.smooth_extruding_moves
+        self.smooth_extruding_moves = not not gcmd.get_int(
+                'SMOOTH_EXTRUDING_MOVES', self.smooth_extruding_moves)
+        old_smooth_extrude_only_moves = self.smooth_extrude_only_moves
+        smooth_extrude_only_moves = gcmd.get_int('SMOOTH_EXTRUDE_ONLY_MOVES',
+                                                 None)
+        if smooth_extrude_only_moves and not self.smooth_extruding_moves:
+            raise config.error("Cannot smooth extrude-only moves when smoothing"
+                               " for extrude moves is disabled")
+        elif smooth_extrude_only_moves is not None:
+            self.smooth_extrude_only_moves = not not smooth_extrude_only_moves
+        return self.smooth_time != old_smooth_time or \
+                self.smooth_extruding_moves != old_smooth_extruding_moves or \
+                self.smooth_extrude_only_moves != old_smooth_extrude_only_moves
     def update_pa_model(self, pa_model):
         self.pa_model = pa_model
     def enable_axis(self, axis):
@@ -37,11 +57,23 @@ class ExtruderSmoother:
                     extruder_sk, axis.encode(), n, self.a,
                     smooth_time, 0.) == 0:
                 success = False
+        ffi_lib.extruder_set_smooth_moves_params(
+                extruder_sk, self.smooth_extruding_moves,
+                self.smooth_extrude_only_moves)
         return success
     def get_status(self, eventtime):
-        return {'smooth_time': self.smooth_time}
+        return {'smooth_time': self.smooth_time,
+                'smooth_extruding_moves': self.smooth_extruding_moves,
+                'smooth_extrude_only_moves':
+                    self.smooth_extrude_only_moves and
+                    self.smooth_extruding_moves}
     def get_msg(self):
-        return "pressure_advance_smooth_time: %.6f" % (self.smooth_time,)
+        return ("pressure_advance_smooth_time: %.6f\n"
+                "smooth_extruding_moves: %s\n"
+                "smooth_extrude_only_moves: %s" % (
+                    self.smooth_time, self.smooth_extruding_moves,
+                    self.smooth_extrude_only_moves and
+                    self.smooth_extruding_moves))
 
 class PALinearModel:
     name = 'linear'
