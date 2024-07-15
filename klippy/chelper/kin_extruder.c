@@ -162,6 +162,7 @@ struct extruder_stepper {
     struct stepper_kinematics sk;
     struct shaper_pulses sp[3];
     struct smoother sm[3], pa_model_smoother;
+    int smooth_extruding_moves, smooth_extrude_only_moves;
     struct list_head pa_list;
     double time_offset;
 };
@@ -275,18 +276,19 @@ extruder_calc_position(struct stepper_kinematics *sk, struct move *m
         const struct smoother* sm = &es->sm[i];
         int num_pulses = sp->num_pulses;
         if (!sm->hst) {
+            pa_vel.axis[i] = 0.;
+        } else if (num_pulses) {
+            shaper_pa_range_integrate(m, axis, move_time, sp, sm,
+                                      &e_pos.axis[i], &pa_vel.axis[i]);
+        } else {
+            pa_range_integrate(m, axis, move_time, sm,
+                               &e_pos.axis[i], &pa_vel.axis[i]);
+        }
+        if (!sm->hst || !es->smooth_extruding_moves ||
+                (!es->smooth_extrude_only_moves && axis == 'z')) {
             e_pos.axis[i] = num_pulses
                 ? shaper_calc_position(m, axis, move_time, sp)
                 : m->start_pos.axis[i] + m->axes_r.axis[i] * move_dist;
-            pa_vel.axis[i] = 0.;
-        } else {
-            if (num_pulses) {
-                shaper_pa_range_integrate(m, axis, move_time, sp, sm,
-                                          &e_pos.axis[i], &pa_vel.axis[i]);
-            } else {
-                pa_range_integrate(m, axis, move_time, sm,
-                                   &e_pos.axis[i], &pa_vel.axis[i]);
-            }
         }
     }
     double position = e_pos.x + e_pos.y + e_pos.z;
@@ -374,6 +376,16 @@ extruder_set_shaper_params(struct stepper_kinematics *sk, char axis
     int status = init_shaper(n, a, t, sp);
     extruder_note_generation_time(es);
     return status;
+}
+
+void __visible
+extruder_set_smooth_moves_params(struct stepper_kinematics *sk
+                                 , int smooth_extruding_moves
+                                 , int smooth_extrude_only_moves)
+{
+    struct extruder_stepper *es = container_of(sk, struct extruder_stepper, sk);
+    es->smooth_extruding_moves = smooth_extruding_moves;
+    es->smooth_extrude_only_moves = smooth_extrude_only_moves;
 }
 
 int __visible
