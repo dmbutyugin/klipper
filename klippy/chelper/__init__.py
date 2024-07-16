@@ -164,6 +164,8 @@ defs_kin_extruder = """
         , double pa_velocity, struct pressure_advance_params *pa_params);
     double pressure_advance_recipr_model_func(double position
         , double pa_velocity, struct pressure_advance_params *pa_params);
+    double pressure_advance_log_model_func(double position
+        , double pa_velocity, struct pressure_advance_params *pa_params);
     int extruder_set_shaper_params(struct stepper_kinematics *sk, char axis
         , int n, double a[], double t[]);
     int extruder_set_smoothing_params(struct stepper_kinematics *sk, char axis
