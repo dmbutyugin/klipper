@@ -5,7 +5,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
-import optparse, importlib, math, os, sys
+import optparse, importlib, logging, math, os, sys
 import numpy as np, matplotlib
 sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)),
                              '..', 'klippy'))
@@ -21,9 +21,10 @@ def plot_shaper(shaper_name, damping_ratio):
     for c in C_e[::-1]:
         w_e = (w_e * tau + c)
 
+    r = t_sm / (t[-1] - t[0])
     normalized_velocities = velocities / (
             velocities.sum(axis=-1)[:,np.newaxis] * (t[1] - t[0]))
-    mean_velocity = normalized_velocities.mean(axis=0)
+    mean_velocity = velocities.mean(axis=0)
 
     fig, ax = matplotlib.pyplot.subplots(figsize=(10,9))
     ax.set_title("Unit step input")
@@ -32,7 +33,7 @@ def plot_shaper(shaper_name, damping_ratio):
     for i in range(normalized_velocities.shape[0]):
         ax.plot(t, normalized_velocities[i,:], linestyle=styles[dr_i])
     ax.plot(t, mean_velocity, 'b', linewidth=2.0)
-    ax.plot(t, w_e / (t[-1] - t[0]), 'r', linewidth=2.0)
+    ax.plot(t, w_e * r, 'r', linewidth=2.0)
     ax.set_xlabel('Time, sec')
     ax.set_ylabel('Amplitude')
     ax.grid()
@@ -46,6 +47,7 @@ def setup_matplotlib(output_to_file):
     import matplotlib.ticker
 
 def main():
+    logging.basicConfig(level=logging.INFO)
     # Parse command-line arguments
     usage = "%prog [options]"
     opts = optparse.OptionParser(usage)

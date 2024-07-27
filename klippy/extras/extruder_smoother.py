@@ -4,30 +4,32 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
-import collections, importlib, math
+import collections, importlib, logging, math
 shaper_defs = importlib.import_module('.shaper_defs', 'extras')
 shaper_calibrate = importlib.import_module('.shaper_calibrate', 'extras')
 
 ExtruderSmootherCfg = collections.namedtuple(
-        'ExtruderSmootherCfg', ('order', 'freq_opt_range'))
+        'ExtruderSmootherCfg', ('order'))
+
+TEST_FREQ_STEP = 0.01
 
 EXTURDER_SMOOTHERS = {
-        'default' : ExtruderSmootherCfg(-1, (1.0, 1.0, 1)),
-        'zv' : ExtruderSmootherCfg(5, (0.98, 1.02, 5)),
-        'mzv' : ExtruderSmootherCfg(7, (0.95, 1.05, 11)),
-        'zvd' : ExtruderSmootherCfg(7, (0.93, 1.06, 14)),
-        'ei' : ExtruderSmootherCfg(7, (0.83, 0.89, 7)),
-        '2hump_ei' : ExtruderSmootherCfg(9, (0.65, 0.75, 11)),
-        '3hump_ei' : ExtruderSmootherCfg(10, (0.54, 0.66, 13)),
-        'smooth_zv' : ExtruderSmootherCfg(7, (0.98, 1.0, 3)),
-        'smooth_mzv' : ExtruderSmootherCfg(9, (0.95, 1.07, 20)),
-        'smooth_ei' : ExtruderSmootherCfg(9, (0.97, 1.07, 15)),
-        'smooth_zvd_ei' : ExtruderSmootherCfg(11, (0.90, 1.10, 30)),
-        'smooth_2hump_ei' : ExtruderSmootherCfg(11, (0.95, 1.07, 20)),
-        'smooth_si' : ExtruderSmootherCfg(11, (0.95, 1.07, 20)),
+        'default' : ExtruderSmootherCfg(-1),
+        'zv' : ExtruderSmootherCfg(5),
+        'mzv' : ExtruderSmootherCfg(7),
+        'zvd' : ExtruderSmootherCfg(9),
+        'ei' : ExtruderSmootherCfg(9),
+        '2hump_ei' : ExtruderSmootherCfg(11),
+        '3hump_ei' : ExtruderSmootherCfg(11),
+        'smooth_zv' : ExtruderSmootherCfg(7),
+        'smooth_mzv' : ExtruderSmootherCfg(9),
+        'smooth_ei' : ExtruderSmootherCfg(9),
+        'smooth_zvd_ei' : ExtruderSmootherCfg(11),
+        'smooth_2hump_ei' : ExtruderSmootherCfg(11),
+        'smooth_si' : ExtruderSmootherCfg(11),
 }
 
-def _estimate_shaper(np, shaper, test_damping_ratio, test_freqs):
+def _calc_shaper_velocities(np, shaper, test_damping_ratio, test_freqs):
     A, T = np.asarray(shaper[0]), np.asarray(shaper[1])
     inv_D = 1. / A.sum()
     n = len(T)
@@ -35,13 +37,14 @@ def _estimate_shaper(np, shaper, test_damping_ratio, test_freqs):
     hst = t_s * 0.5
 
     test_freqs = np.asarray(test_freqs)
-    t_start, t_end = -hst, hst
+    t_start = -hst
+    t_end = t_s + np.maximum(2. / test_freqs.min(), t_s)
     n_t = 1000
     unity_range = np.linspace(0., 1., n_t)
     time = (t_end - t_start) * unity_range + t_start
     dt = (time[-1] - time[0]) / n_t
 
-    omega = 2. * math.pi * test_freqs[test_freqs > 0.]
+    omega = 2. * math.pi * test_freqs
 
     response = np.zeros(shape=(omega.shape[0], time.shape[-1]))
     for i in range(n):
@@ -49,15 +52,16 @@ def _estimate_shaper(np, shaper, test_damping_ratio, test_freqs):
                                              omega, test_damping_ratio)
         response += A[i] * s_r
     response *= inv_D
-    velocity = (response[:,1:] - response[:,:-1]) / (omega * dt)[:, np.newaxis]
+    velocity = (response[:,1:] - response[:,:-1]) / dt
     return time[:-1], velocity
 
-def _estimate_smoother(np, smoother, test_damping_ratio, test_freqs):
+def _calc_smoother_velocities(np, smoother, test_damping_ratio, test_freqs):
     C, t_sm = smoother[0], smoother[1]
     hst = t_sm * 0.5
 
     test_freqs = np.asarray(test_freqs)
-    t_start, t_end = -t_sm, t_sm
+    t_start = -t_sm
+    t_end = hst + np.maximum(1.5 / test_freqs.min(), 2.0 * t_sm)
     n_t = 1000
     unity_range = np.linspace(0., 1., n_t)
     time = (t_end - t_start) * unity_range + t_start
@@ -73,7 +77,7 @@ def _estimate_smoother(np, smoother, test_damping_ratio, test_freqs):
     w[time > hst] = 0.
     norms = (w * dt).sum(axis=-1)
 
-    omega = 2. * math.pi * test_freqs[test_freqs > 0.]
+    omega = 2. * math.pi * test_freqs
 
     w_ind = (time >= -hst) & (time < hst)
     wl = np.count_nonzero(w_ind)
@@ -87,8 +91,8 @@ def _estimate_smoother(np, smoother, test_damping_ratio, test_freqs):
     s_r = shaper_calibrate.step_response(np, time, omega, test_damping_ratio)
     w_dt = w[w_ind] * ((1. / norms) * dt)
     response = np.einsum("ijk,k->ij", get_windows(s_r, wl), w_dt[::-1])
-    velocity = (response[:,1:] - response[:,:-1]) / (omega * dt)[:, np.newaxis]
-    return time[w_ind], velocity
+    velocity = (response[:,1:] - response[:,:-1]) / dt
+    return time[time >= -hst][:velocity.shape[1]], velocity
 
 def _calc_extruder_smoother(np, shaper_name, t, velocities, n, t_sm):
     zero_derivatives = shaper_name.startswith('smooth_')
@@ -98,16 +102,15 @@ def _calc_extruder_smoother(np, shaper_name, t, velocities, n, t_sm):
         return [15. / 8., 0., -15., 0., 30.]
     m = velocities.shape[0]
 
+    t_offs = 0.5 * (t[-1] + t[0])
     t_i = np.zeros(shape=(t.shape[0], n))
     inv_t_sm = 1. / t_sm
     t_i[:, 0] = inv_t_sm
     for i in range(1, n):
-        t_i[:, i] = t_i[:, i-1] * t * inv_t_sm
-    w = 1. - np.abs(2. * t / t_sm)**2
+        t_i[:, i] = t_i[:, i-1] * (t-t_offs) * inv_t_sm
+    w = 1. - np.abs(2. * (t-t_offs) / t_sm)**2
 
-    normalized_velocities = velocities / (
-            velocities.sum(axis=-1)[:,np.newaxis] * (t[1] - t[0]))
-    rhs = normalized_velocities.flat * np.tile(w, m)
+    rhs = velocities.flat * np.tile(w, m)
     A = np.tile(t_i, (m, 1))
     Aw = np.tile(t_i * w[:,np.newaxis], (m, 1))
 
@@ -125,11 +128,21 @@ def _calc_extruder_smoother(np, shaper_name, t, velocities, n, t_sm):
         B[3, :] = np.power(-0.5, np.arange(n)) * np.arange(n)
         B[4, :] = np.power(0.5, np.arange(n)) * np.arange(n)
         f[3] = f[4] = 0.
-    if shaper_name == '3hump_ei':
-        B[3, :] = np.power(0.5, np.arange(n)) * np.arange(n)
-        f[3] = 0.
     C = np.linalg.solve(B, f)
     return C
+
+def _get_first_pole(np, damping_ratio, t, velocities, test_freqs):
+    min_v = -shaper_calibrate.step_response_min_velocity(damping_ratio)
+    max_vib = -velocities.min(axis=-1) / (2. * math.pi * min_v * test_freqs)
+    first_pole_ind = np.argmax(max_vib[1:] - max_vib[:-1] > 0.)
+    pole_lthr = np.maximum(max_vib[first_pole_ind] * 1.1, 0.04)
+    all_inds = np.arange(max_vib.shape[0])
+    pole_lind = np.where((max_vib < pole_lthr) & (all_inds <= first_pole_ind))
+    pole_rthr = (pole_lthr + max_vib[first_pole_ind] * 2.) / 3.
+    max_rend = first_pole_ind + (first_pole_ind - pole_lind[0][0] + 1) / 2
+    pole_rind = np.where((max_vib < pole_rthr) &
+                         (all_inds > first_pole_ind) & (all_inds <= max_rend))
+    return np.concatenate([pole_lind, pole_rind], axis=None)
 
 def get_extruder_smoother(shaper_name, smooth_time, damping_ratio,
                           normalize_coeffs=True, return_velocities=False):
@@ -143,7 +156,7 @@ def get_extruder_smoother(shaper_name, smooth_time, damping_ratio,
     shaper_name = shaper_name.lower()
     smoother_cfg = EXTURDER_SMOOTHERS.get(
             shaper_name, EXTURDER_SMOOTHERS['default'])
-    test_freqs = np.linspace(*smoother_cfg.freq_opt_range)
+    test_freq_bins = np.arange(.2, 2., TEST_FREQ_STEP)
     n = smoother_cfg.order
     for s in shaper_defs.INPUT_SHAPERS:
         if s.name == shaper_name:
@@ -152,8 +165,8 @@ def get_extruder_smoother(shaper_name, smooth_time, damping_ratio,
                 n = 2 * len(A) + 1
             t_sm = T[-1] - T[0]
             shaper = A, T
-            t, velocities = _estimate_shaper(np, shaper,
-                                             damping_ratio, test_freqs)
+            t, velocities = _calc_shaper_velocities(
+                    np, shaper, damping_ratio, test_freq_bins)
             break
     for s in shaper_defs.INPUT_SMOOTHERS:
         if s.name == shaper_name:
@@ -161,11 +174,19 @@ def get_extruder_smoother(shaper_name, smooth_time, damping_ratio,
             if n < 0:
                 n = len(C)
             smoother = C, t_sm
-            t, velocities = _estimate_smoother(np, smoother,
-                                               damping_ratio, test_freqs)
+            t, velocities = _calc_smoother_velocities(
+                    np, smoother, damping_ratio, test_freq_bins)
             break
-    C_e = _calc_extruder_smoother(np, shaper_name, t, velocities, n, t_sm)
-    smoother = shaper_defs.init_smoother(C_e[::-1], smooth_time,
+    ind = _get_first_pole(np, damping_ratio, t, velocities, test_freq_bins)
+    mean_velocity = velocities[ind].mean(axis=0)
+    t_thr = min(np.argmax(t > 0.5 * t_sm),
+                np.argmax(mean_velocity[t > 0.] < mean_velocity.max() * 0.01)
+                + np.argmax(t > 0.))
+    t_s = t_sm if t[t_thr] > 0.5 * t_sm else t[t_thr-1] + 0.5 * t_sm
+    t = t[:t_thr]
+    velocities = velocities[ind,:t_thr]
+    C_e = _calc_extruder_smoother(np, shaper_name, t, velocities, n, t_s)
+    smoother = shaper_defs.init_smoother(C_e[::-1], smooth_time * t_s / t_sm,
                                          normalize_coeffs)
     if not return_velocities:
         return smoother
