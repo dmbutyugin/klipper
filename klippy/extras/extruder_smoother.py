@@ -170,7 +170,7 @@ def get_extruder_smoother(shaper_name, smooth_time, damping_ratio,
             break
     for s in shaper_defs.INPUT_SMOOTHERS:
         if s.name == shaper_name:
-            C, t_sm = s.init_func(1.0)
+            C, t_sm = s.init_func(1.0, damping_ratio)
             if n < 0:
                 n = len(C)
             smoother = C, t_sm

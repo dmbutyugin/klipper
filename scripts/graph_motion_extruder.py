@@ -311,7 +311,7 @@ def gen_updated_position(positions, shaper_name,
             return calc_shaper(shaper, positions)
     for s in shaper_defs.INPUT_SMOOTHERS:
         if s.name == shaper_name.lower():
-            C, t_sm = s.init_func(shaper_freq)
+            C, t_sm = s.init_func(shaper_freq, shaper_damping_ratio)
             t_offs = shaper_defs.get_smoother_offset(C, t_sm)
             smoother = C, t_sm, t_offs, s.name.upper()
             return calc_smoother(smoother, positions)
@@ -322,14 +322,14 @@ def gen_extr_is_positions(positions, shaper_name,
         if s.name == shaper_name.lower():
             A, T = s.init_func(shaper_freq, shaper_damping_ratio)
             t_sm = T[-1] - T[0]
-            t_offs = shaper_defs.get_shaper_offset(A, T) - .5 * t_sm
+            t_offs = shaper_defs.get_shaper_offset(A, T)
     for s in shaper_defs.INPUT_SMOOTHERS:
         if s.name == shaper_name.lower():
-            C, t_sm = s.init_func(shaper_freq)
-            t_offs = shaper_defs.get_smoother_offset(C, t_sm)
-    C_e, _ = extruder_smoother.get_extruder_smoother(shaper_name, t_sm,
-                                                     shaper_damping_ratio)
-    smoother = C_e, t_sm, t_offs, shaper_name
+            C, t_sm = s.init_func(shaper_freq, shaper_damping_ratio)
+            t_offs = shaper_defs.get_smoother_offset(C, t_sm) + 0.5 * t_sm
+    C_e, t_s = extruder_smoother.get_extruder_smoother(shaper_name, t_sm,
+                                                       shaper_damping_ratio)
+    smoother = C_e, t_s, t_offs - 0.5 * t_s, shaper_name
     return calc_smoother(smoother, positions)
 
 ######################################################################
