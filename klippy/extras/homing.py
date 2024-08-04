@@ -64,7 +64,9 @@ class HomingMove:
             sname = stepper.get_name()
             kin_spos[sname] += offsets.get(sname, 0) * stepper.get_step_dist()
         thpos = self.toolhead.get_position()
-        return list(kin.calc_position(kin_spos))[:3] + thpos[3:]
+        cpos = kin.calc_position(kin_spos)
+        return [cp if cp is not None else tp
+                for cp, tp in zip(cpos, thpos[:3])] + thpos[3:]
     def homing_move(self, movepos, speed, probe_pos=False,
                     triggered=True, check_triggered=True):
         # Notify start of homing/probing move
@@ -222,6 +224,10 @@ class Homing:
                         for s in kin.get_steppers()}
             newpos = kin.calc_position(kin_spos)
             for axis in homing_axes:
+                if newpos[axis] is None:
+                    raise self.printer.command_error(
+                            "Cannot determine position of toolhead on "
+                            "axis %s after homing" % "xyz"[axis])
                 homepos[axis] = newpos[axis]
             self.toolhead.set_position(homepos)
 
