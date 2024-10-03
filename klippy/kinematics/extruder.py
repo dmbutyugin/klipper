@@ -240,9 +240,9 @@ class ExtruderStepper:
         if extruder is None or not isinstance(extruder, PrinterExtruder):
             raise self.printer.command_error("'%s' is not a valid extruder."
                                              % (extruder_name,))
+        if self.extruder is not None and self.extruder != extruder:
+            self.extruder.unlink_extruder_stepper(self)
         extruder.link_extruder_stepper(self)
-        self.motion_queue = extruder_name
-        self.extruder = extruder
     def _update_pressure_advance(self, pa_model, time_offset):
         toolhead = self.printer.lookup_object('toolhead')
         ffi_main, ffi_lib = chelper.get_ffi()
@@ -388,7 +388,6 @@ class PrinterExtruder:
             or config.get('dir_pin', None) is not None
             or config.get('rotation_distance', None) is not None):
             self.link_extruder_stepper(ExtruderStepper(config))
-            self.extruder_steppers[-1].motion_queue = self.name
         # Register commands
         gcode = self.printer.lookup_object('gcode')
         if self.name == 'extruder':
@@ -403,10 +402,14 @@ class PrinterExtruder:
             self.extruder_steppers.append(extruder_stepper)
             extruder_stepper.stepper.set_position(self.last_position)
             extruder_stepper.stepper.set_trapq(self.trapq)
+            extruder_stepper.motion_queue = self.name
+            extruder_stepper.extruder = self
     def unlink_extruder_stepper(self, extruder_stepper):
         if extruder_stepper in self.extruder_steppers:
             self.extruder_steppers.remove(extruder_stepper)
             extruder_stepper.stepper.set_trapq(None)
+            extruder_stepper.motion_queue = None
+            extruder_stepper.extruder = None
     def get_extruder_steppers(self):
         return self.extruder_steppers
     def update_move_time(self, flush_time, clear_history_time):
