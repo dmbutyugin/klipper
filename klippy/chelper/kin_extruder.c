@@ -12,7 +12,6 @@
 #include "itersolve.h" // struct stepper_kinematics
 #include "integrate.h" // struct smoother
 #include "list.h" // list_node
-#include "kin_shaper.h" // struct shaper_pulses
 #include "pyhelper.h" // errorf
 #include "trapq.h" // move_get_distance
 
@@ -140,27 +139,8 @@ pa_range_integrate(const struct move *m, int axis, double move_time
     *pos_integral += start_base;
 }
 
-static void
-shaper_pa_range_integrate(const struct move *m, int axis, double move_time
-                          , const struct shaper_pulses *sp
-                          , const struct smoother *sm
-                          , double *pos_integral, double *pa_velocity_integral)
-{
-    *pos_integral = *pa_velocity_integral = 0.;
-    int num_pulses = sp->num_pulses, i;
-    for (i = 0; i < num_pulses; ++i) {
-        double t = sp->pulses[i].t, a = sp->pulses[i].a;
-        double p_pos_int, p_pa_vel_int;
-        pa_range_integrate(m, axis, move_time + t, sm,
-                           &p_pos_int, &p_pa_vel_int);
-        *pos_integral += a * p_pos_int;
-        *pa_velocity_integral += a * p_pa_vel_int;
-    }
-}
-
 struct extruder_stepper {
     struct stepper_kinematics sk;
-    struct shaper_pulses sp[3];
     struct smoother sm[3], pa_model_smoother;
     int smooth_extruding_moves, smooth_extrude_only_moves;
     struct list_head pa_list;
@@ -285,23 +265,17 @@ extruder_calc_position(struct stepper_kinematics *sk, struct move *m
     double move_dist = move_get_distance(m, move_time);
     for (i = 0; i < 3; ++i) {
         int axis = 'x' + i;
-        const struct shaper_pulses* sp = &es->sp[i];
         const struct smoother* sm = &es->sm[i];
-        int num_pulses = sp->num_pulses;
         if (!sm->hst) {
             pa_vel.axis[i] = 0.;
-        } else if (num_pulses) {
-            shaper_pa_range_integrate(m, axis, move_time, sp, sm,
-                                      &e_pos.axis[i], &pa_vel.axis[i]);
         } else {
             pa_range_integrate(m, axis, move_time, sm,
                                &e_pos.axis[i], &pa_vel.axis[i]);
         }
         if (!sm->hst || !es->smooth_extruding_moves ||
                 (!es->smooth_extrude_only_moves && axis == 'z')) {
-            e_pos.axis[i] = num_pulses
-                ? shaper_calc_position(m, axis, move_time, sp)
-                : m->start_pos.axis[i] + m->axes_r.axis[i] * move_dist;
+            e_pos.axis[i] =
+                m->start_pos.axis[i] + m->axes_r.axis[i] * move_dist;
         }
     }
     double position = e_pos.x + e_pos.y + e_pos.z;
@@ -319,12 +293,9 @@ extruder_note_generation_time(struct extruder_stepper *es)
     double pre_active = 0., post_active = 0.;
     int i;
     for (i = 0; i < 3; ++i) {
-        struct shaper_pulses* sp = &es->sp[i];
         const struct smoother* sm = &es->sm[i];
-        double pre_active_axis = sm->hst + sm->t_offs + es->time_offset +
-            (sp->num_pulses ? sp->pulses[sp->num_pulses-1].t : 0.);
-        double post_active_axis = sm->hst - sm->t_offs - es->time_offset +
-            (sp->num_pulses ? -sp->pulses[0].t : 0.);
+        double pre_active_axis = sm->hst + sm->t_offs + es->time_offset;
+        double post_active_axis = sm->hst - sm->t_offs - es->time_offset;
         if (pre_active_axis > pre_active)
             pre_active = pre_active_axis;
         if (post_active_axis > post_active)
@@ -376,19 +347,6 @@ extruder_set_pressure_advance(struct stepper_kinematics *sk, double print_time
     pa_params->pa_func = func;
     pa_params->active_print_time = print_time;
     list_add_tail(&pa_params->node, &es->pa_list);
-}
-
-int __visible
-extruder_set_shaper_params(struct stepper_kinematics *sk, char axis
-                           , int n, double a[], double t[])
-{
-    if (axis != 'x' && axis != 'y')
-        return -1;
-    struct extruder_stepper *es = container_of(sk, struct extruder_stepper, sk);
-    struct shaper_pulses *sp = &es->sp[axis-'x'];
-    int status = init_shaper(n, a, t, sp);
-    extruder_note_generation_time(es);
-    return status;
 }
 
 void __visible
