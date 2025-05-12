@@ -36,7 +36,7 @@ struct stepper_move {
     int32_t add;
     int32_t add2;
     uint_fast8_t shift;
-    uint16_t int_low_acc;
+    uint_fast16_t int_low_acc;
 #else
     int16_t add;
 #endif
@@ -53,7 +53,7 @@ struct stepper {
     int32_t add;
     int32_t add2;
     uint_fast8_t shift;
-    uint16_t int_low_acc;
+    uint_fast16_t int_low_acc;
 #else
     int16_t add;
 #endif
@@ -131,7 +131,7 @@ stepper_load_next(struct stepper *s)
     int32_t move_add2;
     uint_fast8_t move_shift;
     uint16_t move_int_low_acc;
-    if (move_flags & SF_HIGH_PREC_STEP) {
+    if (likely(move_flags & SF_HIGH_PREC_STEP)) {
         move_add2 = m->add2;
         move_shift = m->shift;
         move_int_low_acc = m->int_low_acc;
@@ -149,7 +149,7 @@ stepper_load_next(struct stepper *s)
     s->add = move_add;
 #if CONFIG_HIGH_PREC_STEP
     s->interval = move_next_interval;
-    if (move_flags & SF_HIGH_PREC_STEP) {
+    if (likely(move_flags & SF_HIGH_PREC_STEP)) {
         s->add2 = move_add2;
         s->shift = move_shift;
         s->int_low_acc = move_int_low_acc;
@@ -223,7 +223,7 @@ stepper_event_edge(struct timer *t)
     uint32_t count = s->count - 1;
     if (likely(count)) {
         s->count = count;
-        if (CONFIG_HIGH_PREC_STEP && (s->flags & SF_HIGH_PREC_STEP)) {
+        if (CONFIG_HIGH_PREC_STEP && likely(s->flags & SF_HIGH_PREC_STEP)) {
             add_interval(&s->time.waketime, s);
             inc_interval(s);
         } else {
@@ -249,15 +249,15 @@ stepper_event_avr(struct timer *t)
     uint16_t *pcount = (void*)&s->count, count = *pcount - 1;
     if (likely(count)) {
         *pcount = count;
-        if (CONFIG_HIGH_PREC_STEP && (s->flags & SF_HIGH_PREC_STEP)) {
+        if (CONFIG_HIGH_PREC_STEP && likely(s->flags & SF_HIGH_PREC_STEP)) {
             add_interval(&s->time.waketime, s);
             gpio_out_toggle_noirq(s->step_pin);
-            if (HAVE_AVR_OPTIMIZATION && (s->flags & SF_HAVE_ADD))
+            if (s->flags & SF_HAVE_ADD)
                 inc_interval(s);
         } else {
             s->time.waketime += s->interval;
             gpio_out_toggle_noirq(s->step_pin);
-            if (HAVE_AVR_OPTIMIZATION && (s->flags & SF_HAVE_ADD))
+            if (s->flags & SF_HAVE_ADD)
                 s->interval += s->add;
         }
         return SF_RESCHEDULE;
@@ -276,11 +276,11 @@ stepper_event_full(struct timer *t)
     uint32_t curtime = timer_read_time();
     uint32_t min_next_time = curtime + s->step_pulse_ticks;
     uint32_t count = s->count - 1;
-    if (likely(count & 1 && !(s->flags & SF_SINGLE_SCHED)))
+    if (unlikely(count & 1 && !(s->flags & SF_SINGLE_SCHED)))
         // Schedule unstep event
         goto reschedule_min;
     if (likely(count)) {
-        if (CONFIG_HIGH_PREC_STEP && (s->flags & SF_HIGH_PREC_STEP)) {
+        if (CONFIG_HIGH_PREC_STEP && likely(s->flags & SF_HIGH_PREC_STEP)) {
             add_interval(&s->next_step_time, s);
             inc_interval(s);
         } else {
@@ -410,7 +410,7 @@ command_queue_step_hp(uint32_t *args)
     uint32_t interval = args[1];
     int32_t add = args[3];
     int32_t add2 = args[4];
-    int8_t shift = args[5];
+    int_fast8_t shift = args[5];
 
     if (shift <= 0) {
         interval <<= -shift;
