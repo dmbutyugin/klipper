@@ -189,6 +189,19 @@ class PrinterExtruder:
         gcode.register_mux_command("ACTIVATE_EXTRUDER", "EXTRUDER",
                                    self.name, self.cmd_ACTIVATE_EXTRUDER,
                                    desc=self.cmd_ACTIVATE_EXTRUDER_help)
+        # Setup tracking of extruder-related kinematic axes
+        self.xy_axes = (0, 1)
+        self.printer.register_event_handler("toolhead:update_extra_axes",
+                                            self._update_extra_axes)
+    def _update_extra_axes(self):
+        toolhead = self.printer.lookup_object('toolhead')
+        extra_axes = toolhead.get_extra_axes()
+        default_xy_axes = [0, 1]
+        # Find any additional axes mapping to 'X' or 'Y'
+        self.xy_axes = tuple(default_xy_axes +
+                             [ind for ind, ea in enumerate(extra_axes)
+                              if ea is not None and ea.is_kinematic_axis()
+                              and ea.get_axis() in default_xy_axes])
     def get_status(self, eventtime):
         sts = self.heater.get_status(eventtime)
         sts['can_extrude'] = self.heater.can_extrude
@@ -214,7 +227,8 @@ class PrinterExtruder:
                 "See the 'min_extrude_temp' config option for details")
         axis_r = move.axes_r[ea_index]
         axis_d = move.axes_d[ea_index]
-        if (not move.axes_d[0] and not move.axes_d[1]) or axis_r < 0.:
+        xy_move = any(move.axes_d[i] for i in self.xy_axes)
+        if not xy_move or axis_r < 0.:
             # Extrude only move (or retraction move) - limit accel and velocity
             if abs(axis_d) > self.max_e_dist:
                 raise self.printer.command_error(
@@ -246,7 +260,8 @@ class PrinterExtruder:
         start_v = move.start_v * axis_r
         cruise_v = move.cruise_v * axis_r
         can_pressure_advance = False
-        if axis_r > 0. and (move.axes_d[0] or move.axes_d[1]):
+        xy_move = any(move.axes_d[i] for i in self.xy_axes)
+        if axis_r > 0. and xy_move:
             can_pressure_advance = True
         # Queue movement (x is extruder movement, y is pressure advance flag)
         self.trapq_append(self.trapq, print_time,
