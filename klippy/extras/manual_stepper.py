@@ -197,6 +197,8 @@ class ManualStepper:
         return move.max_cruise_v2
     def get_axis_gcode_id(self):
         return self.axis_gcode_id
+    def is_kinematic_axis(self):
+        return False
     def get_trapq(self):
         return self.trapq
     # Toolhead wrappers to support homing
