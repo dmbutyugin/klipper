@@ -115,6 +115,8 @@ class DualCarriage:
         return self.primary_carriage
     def add_stepper(self, kin_stepper):
         self.rail.add_stepper(kin_stepper.get_stepper())
+    def is_kinematic_axis(self):
+        return True
 
 class GenericCartesianKinematics:
     def __init__(self, toolhead, config):

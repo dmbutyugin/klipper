@@ -203,6 +203,8 @@ class PrinterExtruder:
         return self.trapq
     def get_axis_gcode_id(self):
         return 'E'
+    def is_kinematic_axis(self):
+        return False
     def stats(self, eventtime):
         return self.heater.stats(eventtime)
     def check_move(self, move, ea_index):
@@ -306,6 +308,8 @@ class DummyExtruder:
         return None
     def get_axis_gcode_id(self):
         return 'E'
+    def is_kinematic_axis(self):
+        return False
 
 def add_printer_objects(config):
     printer = config.get_printer()
