@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2025  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import math, logging, importlib
+import math, logging, importlib, itertools
 import mcu, chelper, kinematics.extruder
 
 # Common suffixes: _d is distance (in mm), _v is velocity (in
@@ -22,12 +22,13 @@ class Move:
         velocity = min(speed, toolhead.max_velocity)
         self.is_kinematic_move = True
         self.axes_d = axes_d = [ep - sp for sp, ep in zip(start_pos, end_pos)]
-        self.move_d = move_d = math.sqrt(sum([d*d for d in axes_d[:3]]))
-        if move_d < .000000001:
+        kin_axes = tuple(toolhead.kin_axes_map.keys())
+        if not any([abs(axes_d[i]) > .000000001 for i in kin_axes]):
             # Extrude only move
-            self.end_pos = ((start_pos[0], start_pos[1], start_pos[2])
-                            + self.end_pos[3:])
-            axes_d[0] = axes_d[1] = axes_d[2] = 0.
+            self.end_pos = tuple(start_pos[i] if i in kin_axes else ep
+                                 for i, ep in enumerate(end_pos))
+            for i in kin_axes:
+                axes_d[i] = 0.
             self.move_d = move_d = max([abs(ad) for ad in axes_d[3:]])
             inv_move_d = 0.
             if move_d:
@@ -36,6 +37,11 @@ class Move:
             velocity = speed
             self.is_kinematic_move = False
         else:
+            axes_d2 = [d*d for d in axes_d[:3]]
+            for i, a in toolhead.kin_axes_map.items():
+                if i != a:
+                    axes_d2[a] = max(axes_d2[a], axes_d[i]**2)
+            self.move_d = move_d = math.sqrt(sum(axes_d2))
             inv_move_d = 1. / move_d
         self.axes_r = [d * inv_move_d for d in axes_d]
         self.min_move_t = move_d / velocity
@@ -63,22 +69,21 @@ class Move:
         ep = self.end_pos
         m = "%s: %.3f %.3f %.3f [%.3f]" % (msg, ep[0], ep[1], ep[2], ep[3])
         return self.toolhead.printer.command_error(m)
-    def calc_junction(self, prev_move):
-        if not self.is_kinematic_move or not prev_move.is_kinematic_move:
-            return
-        # Allow extra axes to calculate maximum junction
-        ea_v2 = [ea.calc_junction(prev_move, self, e_index+3)
-                 for e_index, ea in enumerate(self.toolhead.extra_axes)]
-        max_start_v2 = min([self.max_cruise_v2,
-                            prev_move.max_cruise_v2, prev_move.next_junction_v2,
-                            prev_move.max_start_v2 + prev_move.delta_v2]
-                           + ea_v2)
+    def calc_junction_v2(self, prev_move, axes, normalize=False):
         # Find max velocity using "approximated centripetal velocity"
         axes_r = self.axes_r
         prev_axes_r = prev_move.axes_r
-        junction_cos_theta = -(axes_r[0] * prev_axes_r[0]
-                               + axes_r[1] * prev_axes_r[1]
-                               + axes_r[2] * prev_axes_r[2])
+        junction_cos_theta = -(axes_r[axes[0]] * prev_axes_r[axes[0]]
+                               + axes_r[axes[1]] * prev_axes_r[axes[1]]
+                               + axes_r[axes[2]] * prev_axes_r[axes[2]])
+        if normalize:
+            pscale2 = sum(prev_axes_r[a]**2 for a in axes)
+            cscale2 = sum(axes_r[a]**2 for a in axes)
+            if min(pscale2, cscale2) < .000000001:
+                return None
+            pscale2_inv = 1. / pscale2
+            cscale2_inv = 1. / cscale2
+            junction_cos_theta *= math.sqrt(pscale2_inv * cscale2_inv)
         sin_theta_d2 = math.sqrt(max(0.5*(1.0-junction_cos_theta), 0.))
         cos_theta_d2 = math.sqrt(max(0.5*(1.0+junction_cos_theta), 0.))
         one_minus_sin_theta_d2 = 1. - sin_theta_d2
@@ -91,8 +96,37 @@ class Move:
             quarter_tan_theta_d2 = .25 * sin_theta_d2 / cos_theta_d2
             move_centripetal_v2 = self.delta_v2 * quarter_tan_theta_d2
             pmove_centripetal_v2 = prev_move.delta_v2 * quarter_tan_theta_d2
-            max_start_v2 = min(max_start_v2, move_jd_v2, pmove_jd_v2,
-                               move_centripetal_v2, pmove_centripetal_v2)
+            if normalize:
+                move_jd_v2 *= cscale2_inv
+                pmove_jd_v2 *= pscale2_inv
+                move_centripetal_v2 *= cscale2_inv
+                pmove_centripetal_v2 *= pscale2_inv
+            return min(move_jd_v2, pmove_jd_v2,
+                       move_centripetal_v2, pmove_centripetal_v2)
+        return None
+    def calc_junction(self, prev_move):
+        if not self.is_kinematic_move or not prev_move.is_kinematic_move:
+            return
+        # Allow extra axes to calculate maximum junction
+        ea_j_v2 = [ea.calc_junction(prev_move, self, e_index+3)
+                   for e_index, ea in enumerate(self.toolhead.extra_axes)
+                   if not ea.is_kinematic_axis()]
+        max_start_v2 = min([self.max_cruise_v2,
+                            prev_move.max_cruise_v2, prev_move.next_junction_v2,
+                            prev_move.max_start_v2 + prev_move.delta_v2]
+                           + ea_j_v2)
+        if len(self.toolhead.kin_axes_map) > 3:
+            # Consider all combinations of axes mapped to 'x', 'y', and 'z'
+            for axes in itertools.product(
+                    *([v[0] for v in vl] for _, vl in itertools.groupby(
+                        self.toolhead.kin_axes_map.items(), lambda x: x[1]))):
+                j_v2 = self.calc_junction_v2(prev_move, axes, normalize=True)
+                if j_v2 is not None:
+                    max_start_v2 = min(max_start_v2, j_v2)
+        else:
+            j_v2 = self.calc_junction_v2(prev_move, axes=(0, 1, 2))
+            if j_v2 is not None:
+                max_start_v2 = min(max_start_v2, j_v2)
         # Apply limits
         self.max_start_v2 = max_start_v2
         self.max_mcr_start_v2 = min(
@@ -237,8 +271,9 @@ class ToolHead:
         self.Coord = gcode.Coord
         extruder = kinematics.extruder.DummyExtruder(self.printer)
         self.extra_axes = [extruder]
+        self.kin_axes_map = {}
         self.extra_axes_status = {}
-        self._build_extra_axes_status()
+        self._rebuild_extra_axes()
         kin_name = config.get('kinematics')
         try:
             mod = importlib.import_module('kinematics.' + kin_name)
@@ -280,15 +315,17 @@ class ToolHead:
         next_move_time = self.print_time
         with self.reactor.assert_no_pause():
             for move in moves:
-                if move.is_kinematic_move:
+                if any(move.axes_r[:3]):
                     self.trapq_append(
                         self.trapq, next_move_time,
                         move.accel_t, move.cruise_t, move.decel_t,
                         move.start_pos[0], move.start_pos[1], move.start_pos[2],
                         move.axes_r[0], move.axes_r[1], move.axes_r[2],
                         move.start_v, move.cruise_v, move.accel)
+                if len(self.kin_axes_map) > 3:
+                    self.kin.process_move(next_move_time, move)
                 for e_index, ea in enumerate(self.extra_axes):
-                    if move.axes_d[e_index + 3]:
+                    if move.axes_d[e_index + 3] and not ea.is_kinematic_axis():
                         ea.process_move(next_move_time, move, e_index + 3)
                 next_move_time = (next_move_time + move.accel_t
                                   + move.cruise_t + move.decel_t)
@@ -427,22 +464,26 @@ class ToolHead:
             if not self.can_pause:
                 break
             eventtime = self.reactor.pause(eventtime + 0.100)
-    def _build_extra_axes_status(self):
+    def _rebuild_extra_axes(self):
         enames = [ea.get_name() for ea in self.extra_axes]
         self.extra_axes_status = {n: e_index + 3
                                   for e_index, n in enumerate(enames) if n}
+        self.kin_axes_map = {0: 0, 1: 1, 2: 2}
+        for e_index, ea in enumerate(self.extra_axes):
+            if ea.is_kinematic_axis():
+                self.kin_axes_map[e_index + 3] = ea.get_axis()
     def set_extruder(self, extruder, extrude_pos):
         # XXX - should use add_extra_axis
         self.extra_axes[0] = extruder
         self.commanded_pos[3] = extrude_pos
-        self._build_extra_axes_status()
+        self._rebuild_extra_axes()
     def get_extruder(self):
         return self.extra_axes[0]
     def add_extra_axis(self, ea, axis_pos):
         self._flush_lookahead()
         self.extra_axes.append(ea)
         self.commanded_pos.append(axis_pos)
-        self._build_extra_axes_status()
+        self._rebuild_extra_axes()
         self.printer.send_event("toolhead:update_extra_axes")
     def remove_extra_axis(self, ea):
         self._flush_lookahead()
@@ -451,7 +492,7 @@ class ToolHead:
         ea_index = self.extra_axes.index(ea) + 3
         self.commanded_pos.pop(ea_index)
         self.extra_axes.pop(ea_index - 3)
-        self._build_extra_axes_status()
+        self._rebuild_extra_axes()
         self.printer.send_event("toolhead:update_extra_axes")
     def get_extra_axes(self):
         return [None, None, None] + self.extra_axes
