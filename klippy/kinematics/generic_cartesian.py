@@ -36,6 +36,7 @@ def mat_pseudo_inverse(m):
 class MainCarriage:
     def __init__(self, config):
         self.rail = stepper.GenericPrinterRail(config)
+        self.homed = False
         carriage_name = self.rail.get_name(short=True)
         if carriage_name in VALID_AXES:
             self.axis_name = config.getchoice('axis', VALID_AXES, carriage_name)
@@ -55,6 +56,10 @@ class MainCarriage:
         if self.dual_carriage is None:
             return True
         return self.dual_carriage.get_dc_module().is_active(self.rail)
+    def is_homed(self):
+        return self.homed
+    def set_homed(self, homed=True):
+        self.homed = homed
     def set_dual_carriage(self, carriage):
         self.dual_carriage = carriage
     def get_dual_carriage(self):
@@ -79,6 +84,7 @@ class DualCarriage:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.rail = stepper.GenericPrinterRail(config)
+        self.homed = False
         self.primary_carriage_name = config.get('primary_carriage', None)
         if self.primary_carriage_name is None:
             self.axis_name = config.getchoice('axis', VALID_AXES)
@@ -127,6 +133,10 @@ class DualCarriage:
         return self.printer.lookup_object('dual_carriage')
     def is_active(self):
         return self.get_dc_module().is_active(self.rail)
+    def is_homed(self):
+        return self.homed
+    def set_homed(self, homed=True):
+        self.homed = homed
     def set_dual_carriage(self, carriage):
         self.dual_carriage = carriage
     def get_dual_carriage(self):
@@ -143,6 +153,7 @@ class DualCarriage:
 class GenericCartesianKinematics:
     def __init__(self, toolhead, config):
         self.printer = config.get_printer()
+        self.toolhead = toolhead
         self._load_kinematics(config)
         for s in self.get_steppers():
             s.set_trapq(toolhead.get_trapq())
@@ -188,7 +199,11 @@ class GenericCartesianKinematics:
                                               above=0., maxval=max_velocity)
         self.max_z_accel = config.getfloat('max_z_accel', max_accel,
                                            above=0., maxval=max_accel)
-        self.limits = [(1.0, -1.0)] * 3
+        self.limits = [None] * 3
+        for carriage in self.carriages.values():
+            if not carriage.is_active():
+                continue
+            self.limits[carriage.get_axis()] = carriage.get_rail().get_range()
         # Register gcode commands
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command("SET_STEPPER_CARRIAGES",
@@ -294,11 +309,7 @@ class GenericCartesianKinematics:
                 pos[0][i] = None
         return pos[0]
     def update_limits(self, i, range):
-        l, h = self.limits[i]
-        # Only update limits if this axis was already homed,
-        # otherwise leave in un-homed state.
-        if l <= h:
-            self.limits[i] = range
+        self.limits[i] = range
     def set_position(self, newpos, homing_axes):
         for s in self.kin_steppers:
             s.set_position(newpos)
@@ -306,12 +317,15 @@ class GenericCartesianKinematics:
             axis = "xyz".index(axis_name)
             for c in self.carriages.values():
                 if c.get_axis() == axis and c.is_active():
-                    self.limits[axis] = c.get_rail().get_range()
+                    self.update_limits(axis, c.get_rail().get_range())
+                    c.set_homed()
                     break
     def clear_homing_state(self, clear_axes):
-        for axis, axis_name in enumerate("xyz"):
+        for c in self.carriages.values():
+            axis = c.get_axis()
+            axis_name = "xyz"[axis]
             if axis_name in clear_axes:
-                self.limits[axis] = (1.0, -1.0)
+                c.set_homed(homed=False)
     def home_axis(self, homing_state, axis, rail):
         # Determine movement
         position_min, position_max = rail.get_range()
@@ -335,31 +349,28 @@ class GenericCartesianKinematics:
             else:
                 carriage = primary_carriages[axis]
                 self.home_axis(homing_state, axis, carriage.get_rail())
-    def _check_endstops(self, move):
-        end_pos = move.end_pos
-        for i in (0, 1, 2):
-            if (move.axes_d[i]
-                and (end_pos[i] < self.limits[i][0]
-                     or end_pos[i] > self.limits[i][1])):
-                if self.limits[i][0] > self.limits[i][1]:
-                    raise move.move_error("Must home axis first")
-                raise move.move_error()
     def check_move(self, move):
         limits = self.limits
-        xpos, ypos = move.end_pos[:2]
-        if (xpos < limits[0][0] or xpos > limits[0][1]
-            or ypos < limits[1][0] or ypos > limits[1][1]):
-            self._check_endstops(move)
+        end_pos = move.end_pos
+        for c in self.carriages.values():
+            axis = c.get_axis()
+            if not move.axes_d[axis]:
+                continue
+            if c.is_active() and not c.is_homed():
+                raise move.move_error("Must home axis first")
+            if (end_pos[axis] < self.limits[axis][0]
+                or end_pos[axis] > self.limits[axis][1]):
+                raise move.move_error()
         if not move.axes_d[2]:
             # Normal XY move - use defaults
             return
         # Move with Z - update velocity and accel for slower Z axis
-        self._check_endstops(move)
         z_ratio = move.move_d / abs(move.axes_d[2])
         move.limit_speed(
             self.max_z_velocity * z_ratio, self.max_z_accel * z_ratio)
     def get_status(self, eventtime):
-        axes = [a for a, (l, h) in zip("xyz", self.limits) if l <= h]
+        homed_axes = ["xyz"[c.get_axis()] for c in self.carriages.values()
+                      if c.is_active() and c.is_homed()]
         ranges = [(min(c.get_rail().get_range()[0]
                        for c in self.carriages.values()
                        if c.get_axis() == axis),
@@ -370,14 +381,13 @@ class GenericCartesianKinematics:
         axes_min = gcode.Coord([r[0] for r in ranges])
         axes_max = gcode.Coord([r[1] for r in ranges])
         return {
-            'homed_axes': "".join(axes),
+            'homed_axes': "".join(homed_axes),
             'axis_minimum': axes_min,
             'axis_maximum': axes_max,
         }
     cmd_SET_STEPPER_CARRIAGES_help = "Set stepper carriages"
     def cmd_SET_STEPPER_CARRIAGES(self, gcmd):
-        toolhead = self.printer.lookup_object('toolhead')
-        toolhead.flush_step_generation()
+        self.toolhead.flush_step_generation()
         stepper_name = gcmd.get("STEPPER")
         steppers = [stepper for stepper in self.kin_steppers
                     if stepper.get_name() == stepper_name
@@ -395,7 +405,7 @@ class GenericCartesianKinematics:
             stepper.update_kin_coeffs(old_kin_coeffs)
             raise gcmd.error("SET_STEPPER_CARRIAGES cannot add or remove "
                              "carriages that the stepper controls")
-        pos = toolhead.get_position()
+        pos = self.toolhead.get_position()
         stepper.set_position(pos)
         if not validate:
             return
