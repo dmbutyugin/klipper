@@ -121,6 +121,11 @@ class DualCarriage:
         if self.axis > 1:
             raise self.config_error("Invalid axis '%s' for dual_carriage '%s'" %
                                     ("xyz"[self.axis], self.get_name()))
+        if self.safe_dist is None:
+            dc_range = self.rail.get_range()
+            pc_range = self.primary_carriage.get_rail().get_range()
+            self.safe_dist = min([abs(l_pc - l_dc)
+                                  for l_pc, l_dc in zip(pc_range, dc_range)])
     def get_name(self):
         return self.rail.get_name(short=True)
     def get_axis(self):
@@ -147,8 +152,76 @@ class DualCarriage:
         return self.primary_carriage
     def add_stepper(self, kin_stepper):
         self.rail.add_stepper(kin_stepper.get_stepper())
+    def get_axis_gcode_id(self):
+        return self.get_name().upper()
     def is_kinematic_axis(self):
         return True
+    def check_move(self, move, ea_index):
+        axis = self.axis
+        if not move.axes_d[ea_index] and not move.axes_d[axis]:
+            return
+        if self.safe_dist:
+            start_pos = move.start_pos
+            end_pos = move.end_pos
+            ds = start_pos[axis] - start_pos[ea_index]
+            de = end_pos[axis] - end_pos[ea_index]
+            if min(abs(ds), abs(de)) < self.safe_dist:
+                # Carriages get too close
+                raise move.move_error()
+            if (ds < 0) != (de < 0):
+                # Carriages trajectories intersect
+                raise move.move_error()
+        if not move.axes_d[ea_index]:
+            return
+        if not self.is_homed():
+            raise move.move_error(
+                    "Must home carriage %s first" % self.get_axis_gcode_id())
+        limits = self.get_rail().get_range()
+        end_pos = move.end_pos[ea_index]
+        if end_pos < limits[0] or end_pos > limits[1]:
+            raise move.move_error()
+
+class DCVirtualToolhead:
+    def __init__(self, config, toolhead):
+        self.printer = config.get_printer()
+        self.toolhead = toolhead
+        self.direct_dc_carriages = []
+        self.motion_queuing = self.printer.load_object(config, 'motion_queuing')
+        self.trapq = self.motion_queuing.allocate_trapq()
+        self.trapq_append = self.motion_queuing.lookup_trapq_append()
+    def get_active_carriages(self):
+        return self.direct_dc_carriages
+    def activate_direct_mode(self, dual_carriage, carriage_pos):
+        self.toolhead.add_extra_axis(dual_carriage, carriage_pos)
+        self.direct_dc_carriages.append(dual_carriage)
+        dual_carriage.get_rail().set_trapq(self.trapq)
+    def deactivate_direct_mode(self, dual_carriage):
+        if dual_carriage not in self.direct_dc_carriages:
+            return
+        self.toolhead.remove_extra_axis(dual_carriage)
+        self.direct_dc_carriages.remove(dual_carriage)
+        # Restore the trapq of the main toolhead for the steppers no longer
+        # associated with the carriages under direct control
+        dual_carriage.get_rail().set_trapq(self.toolhead.get_trapq())
+        for active_dc in self.direct_dc_carriages:
+            active_dc.get_rail().set_trapq(self.trapq)
+    def process_move(self, print_time, move):
+        extra_axes = self.toolhead.get_extra_axes()
+        axes_r = list(move.axes_r)
+        start_pos = list(move.start_pos)
+        for ea_index, ea in enumerate(extra_axes):
+            if ea in self.direct_dc_carriages:
+                dc_axis = ea.get_axis()
+                start_pos[dc_axis] = start_pos[ea_index]
+                axes_r[dc_axis] = axes_r[ea_index]
+        if not any(axes_r):
+            return
+        self.trapq_append(
+            self.trapq, print_time,
+            move.accel_t, move.cruise_t, move.decel_t,
+            start_pos[0], start_pos[1], start_pos[2],
+            axes_r[0], axes_r[1], axes_r[2],
+            move.start_v, move.cruise_v, move.accel)
 
 class GenericCartesianKinematics:
     def __init__(self, toolhead, config):
@@ -157,7 +230,7 @@ class GenericCartesianKinematics:
         self._load_kinematics(config)
         for s in self.get_steppers():
             s.set_trapq(toolhead.get_trapq())
-        self.dc_module = None
+        self.dc_module = self.dc_toolhead = None
         if self.dc_carriages:
             dc_axes = set(dc.get_axis() for dc in self.dc_carriages)
             pcs = ([pc for pc in self.primary_carriages
@@ -171,6 +244,7 @@ class GenericCartesianKinematics:
             safe_dist = [dc.get_safe_dist() if dc else None for dc in dcs]
             self.dc_module = dc_module = idex_modes.DualCarriages(
                     self.printer, primary_rails, dual_rails, axes, safe_dist)
+            self.dc_toolhead = DCVirtualToolhead(config, toolhead)
             zero_pos = (0., 0.)
             for acs in itertools.product(*zip(pcs, dcs)):
                 for c in acs:
@@ -361,6 +435,11 @@ class GenericCartesianKinematics:
             if (end_pos[axis] < self.limits[axis][0]
                 or end_pos[axis] > self.limits[axis][1]):
                 raise move.move_error()
+            dc = c.get_dual_carriage()
+            if dc is not None and dc in self.dc_toolhead.get_active_carriages():
+                extra_axes = self.toolhead.get_extra_axes()
+                # Always check with the dual carriage even if it is not moving
+                dc.check_move(move, extra_axes.index(dc))
         if not move.axes_d[2]:
             # Normal XY move - use defaults
             return
@@ -368,6 +447,23 @@ class GenericCartesianKinematics:
         z_ratio = move.move_d / abs(move.axes_d[2])
         move.limit_speed(
             self.max_z_velocity * z_ratio, self.max_z_accel * z_ratio)
+    def process_move(self, print_time, move):
+        self.dc_toolhead.process_move(print_time, move)
+    def activate_dc_direct_mode(self, carriage_name, carriage_pos):
+        for dc in self.dc_carriages:
+            if dc.get_name() == carriage_name:
+                self.dc_toolhead.activate_direct_mode(dc, carriage_pos)
+                return
+        raise self.printer.command_error(
+                "Cannot activate direct mode for carriage '%s'" % carriage_name)
+    def deactivate_dc_direct_mode(self, carriage_name):
+        for dc in self.dc_carriages:
+            if dc.get_name() == carriage_name:
+                self.dc_toolhead.deactivate_direct_mode(dc)
+                return
+        raise self.printer.command_error(
+                "Cannot deactivate direct mode for carriage '%s'"
+                % carriage_name)
     def get_status(self, eventtime):
         homed_axes = ["xyz"[c.get_axis()] for c in self.carriages.values()
                       if c.is_active() and c.is_homed()]

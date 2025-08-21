@@ -11,9 +11,10 @@ INACTIVE = 'INACTIVE'
 PRIMARY = 'PRIMARY'
 COPY = 'COPY'
 MIRROR = 'MIRROR'
+DIRECT = 'DIRECT'
 
 class DualCarriages:
-    VALID_MODES = [INACTIVE, PRIMARY, COPY, MIRROR]
+    VALID_MODES = [INACTIVE, PRIMARY, COPY, MIRROR, DIRECT]
     def __init__(self, printer, primary_rails, dual_rails, axes, safe_dist):
         self.printer = printer
         self._init_steppers(primary_rails + dual_rails)
@@ -163,6 +164,10 @@ class DualCarriages:
                                 + axes_pos[0] - dcs[0].rail.position_max)
                 range_max = min(range_max, axis_pos
                                 + axes_pos[0] - dcs[0].rail.position_min)
+            if DIRECT in [dc.mode for dc in dcs]:
+                # Proximity checks with a carriage in DIRECT mode are handled
+                # by the kinematics code
+                continue
             safe_dist = dcs[0].safe_dist
             if not safe_dist or len(dcs) == 1:
                 continue
@@ -229,6 +234,9 @@ class DualCarriages:
         if mode == INACTIVE:
             dc.inactivate(toolhead.get_position())
         elif mode == PRIMARY:
+            if dc.mode == DIRECT:
+                # Must inactivate the carriage in DIRECT mode first
+                dc.inactivate(toolhead.get_position())
             self.toggle_active_dc_rail(dc)
         else:
             dc.activate(mode, toolhead.get_position())
@@ -238,13 +246,16 @@ class DualCarriages:
             dc_rail.apply_transform()
     cmd_SET_DUAL_CARRIAGE_help = "Configure the dual carriages mode"
     def cmd_SET_DUAL_CARRIAGE(self, gcmd):
+        mode = gcmd.get('MODE', PRIMARY).upper()
+        if mode not in self.VALID_MODES:
+            raise gcmd.error("Invalid mode=%s specified" % (mode,))
         carriage_str = gcmd.get('CARRIAGE', None)
         if carriage_str is None:
             raise gcmd.error('CARRIAGE must be specified')
+        dc_rail = None
         if carriage_str in self.dc_rails:
             dc_rail = self.dc_rails[carriage_str]
-        else:
-            dc_rail = None
+        elif mode != DIRECT:
             if len(self.dc_rails) == 2:
                 try:
                     index = int(carriage_str.strip())
@@ -254,12 +265,9 @@ class DualCarriages:
                                else self.primary_rails)[0]
                 except ValueError:
                     pass
-            if dc_rail is None:
-                raise gcmd.error('Invalid CARRIAGE=%s specified' % carriage_str)
-        mode = gcmd.get('MODE', PRIMARY).upper()
-        if mode not in self.VALID_MODES:
-            raise gcmd.error("Invalid mode=%s specified" % (mode,))
-        if mode in [COPY, MIRROR]:
+        if dc_rail is None:
+            raise gcmd.error('Invalid CARRIAGE=%s specified' % carriage_str)
+        if mode in [COPY, MIRROR, DIRECT]:
             if self.get_primary_rail(dc_rail.axis) in [None, dc_rail.rail]:
                 raise gcmd.error(
                         "Must activate another carriage as PRIMARY first")
@@ -315,6 +323,7 @@ class DualCarriages:
                 cur_pos.append(toolhead.get_position())
             dl = [carriage_positions[dc.get_name()] - cur_pos[i][dc.axis]
                   for i, dc in enumerate(dcs)]
+            move_pos = list(toolhead.get_position())
             for axis in self.axes:
                 dc_ind = [i for i, dc in enumerate(dcs) if dc.axis == axis]
                 abs_dl = [abs(dl[i]) for i in dc_ind]
@@ -373,8 +382,19 @@ class DualCarriagesRail:
         return self.rail.get_name()
     def is_active(self):
         return self.mode != INACTIVE
+    def get_axis(self, mode=None):
+        if (mode or self.mode) != DIRECT:
+            return self.axis
+        axis_name = self.rail.get_name(short=True).upper()
+        extra_axes = self.printer.lookup_object('toolhead').get_extra_axes()
+        for index, ea in enumerate(extra_axes):
+            if ea is None:
+                continue
+            if axis_name == ea.get_axis_gcode_id():
+                return index
+        return None
     def get_axis_position(self, position):
-        return position[self.axis] * self.scale + self.offset
+        return position[self.get_axis()] * self.scale + self.offset
     def apply_transform(self):
         ffi_main, ffi_lib = chelper.get_ffi()
         for sk in self.sks:
@@ -384,16 +404,27 @@ class DualCarriagesRail:
     def activate(self, mode, position, old_position=None):
         old_axis_position = self.get_axis_position(old_position or position)
         self.scale = -1. if mode == MIRROR else 1.
-        self.offset = old_axis_position - position[self.axis] * self.scale
+        if mode == DIRECT:
+            self.offset = 0.
+            toolhead = self.printer.lookup_object('toolhead')
+            kin = toolhead.get_kinematics()
+            kin.activate_dc_direct_mode(self.rail.get_name(short=True),
+                                        old_axis_position)
+        else:
+            self.offset = old_axis_position - position[self.axis] * self.scale
         self.apply_transform()
         self.mode = mode
     def inactivate(self, position):
         self.offset = self.get_axis_position(position)
         self.scale = 0.
+        if self.mode == DIRECT:
+            toolhead = self.printer.lookup_object('toolhead')
+            kin = toolhead.get_kinematics()
+            kin.deactivate_dc_direct_mode(self.rail.get_name(short=True))
         self.apply_transform()
         self.mode = INACTIVE
     def override_axis_scaling(self, new_scale, position):
         old_axis_position = self.get_axis_position(position)
         self.scale = math.copysign(new_scale, self.scale)
-        self.offset = old_axis_position - position[self.axis] * self.scale
+        self.offset = old_axis_position - position[self.get_axis()] * self.scale
         self.apply_transform()
