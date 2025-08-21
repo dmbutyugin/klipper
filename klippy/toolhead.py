@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2025  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import math, logging, importlib, itertools
+import math, logging, importlib
 import mcu, chelper, kinematics.extruder
 
 # Common suffixes: _d is distance (in mm), _v is velocity (in
@@ -69,7 +69,7 @@ class Move:
         ep = self.end_pos
         m = "%s: %.3f %.3f %.3f [%.3f]" % (msg, ep[0], ep[1], ep[2], ep[3])
         return self.toolhead.printer.command_error(m)
-    def calc_junction_v2(self, prev_move, axes, normalize=False):
+    def calc_junction_v2(self, prev_move, axes=(0, 1, 2), normalize=False):
         # Find max velocity using "approximated centripetal velocity"
         axes_r = self.axes_r
         prev_axes_r = prev_move.axes_r
@@ -80,7 +80,7 @@ class Move:
             pscale2 = sum(prev_axes_r[a]**2 for a in axes)
             cscale2 = sum(axes_r[a]**2 for a in axes)
             if min(pscale2, cscale2) < .000000001:
-                return None
+                return prev_move.next_junction_v2
             pscale2_inv = 1. / pscale2
             cscale2_inv = 1. / cscale2
             junction_cos_theta *= math.sqrt(pscale2_inv * cscale2_inv)
@@ -101,32 +101,23 @@ class Move:
                 pmove_jd_v2 *= pscale2_inv
                 move_centripetal_v2 *= cscale2_inv
                 pmove_centripetal_v2 *= pscale2_inv
-            return min(move_jd_v2, pmove_jd_v2,
+            return min(prev_move.next_junction_v2, move_jd_v2, pmove_jd_v2,
                        move_centripetal_v2, pmove_centripetal_v2)
-        return None
+        return prev_move.next_junction_v2
     def calc_junction(self, prev_move):
         if not self.is_kinematic_move or not prev_move.is_kinematic_move:
             return
+        if len(self.toolhead.kin_axes_map) > 3:
+            j_v2 = self.toolhead.kin.calc_junction(prev_move, self)
+        else:
+            j_v2 = self.calc_junction_v2(prev_move)
         # Allow extra axes to calculate maximum junction
         ea_j_v2 = [ea.calc_junction(prev_move, self, e_index+3)
                    for e_index, ea in enumerate(self.toolhead.extra_axes)
                    if not ea.is_kinematic_axis()]
-        max_start_v2 = min([self.max_cruise_v2,
-                            prev_move.max_cruise_v2, prev_move.next_junction_v2,
+        max_start_v2 = min([j_v2, self.max_cruise_v2, prev_move.max_cruise_v2,
                             prev_move.max_start_v2 + prev_move.delta_v2]
                            + ea_j_v2)
-        if len(self.toolhead.kin_axes_map) > 3:
-            # Consider all combinations of axes mapped to 'x', 'y', and 'z'
-            for axes in itertools.product(
-                    *([v[0] for v in vl] for _, vl in itertools.groupby(
-                        self.toolhead.kin_axes_map.items(), lambda x: x[1]))):
-                j_v2 = self.calc_junction_v2(prev_move, axes, normalize=True)
-                if j_v2 is not None:
-                    max_start_v2 = min(max_start_v2, j_v2)
-        else:
-            j_v2 = self.calc_junction_v2(prev_move, axes=(0, 1, 2))
-            if j_v2 is not None:
-                max_start_v2 = min(max_start_v2, j_v2)
         # Apply limits
         self.max_start_v2 = max_start_v2
         self.max_mcr_start_v2 = min(

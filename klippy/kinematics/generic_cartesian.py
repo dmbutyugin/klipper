@@ -267,6 +267,14 @@ class GenericCartesianKinematics:
                         idex_modes.PRIMARY, zero_pos)
         else:
             self._check_kinematics(config.error)
+        self.track_junction_carriages = []
+        self._default_junction_carriages = [
+                [c for c in self.carriages.values() if c.is_active()],
+                # Dual carriages + remaining complements
+                self.dc_carriages + [
+                    c for c in self.carriages.values()
+                    if c.is_active() and c.get_dual_carriage() is None]]
+        self.test_junction_axes_set = [(0, 1, 2)]
         # Setup boundary checks
         max_velocity, max_accel = toolhead.get_max_velocity()
         self.max_z_velocity = config.getfloat('max_z_velocity', max_velocity,
@@ -283,6 +291,11 @@ class GenericCartesianKinematics:
         gcode.register_command("SET_STEPPER_CARRIAGES",
                                self.cmd_SET_STEPPER_CARRIAGES,
                                desc=self.cmd_SET_STEPPER_CARRIAGES_help)
+        gcode.register_command("SET_TRACK_CARRIAGES_JUNCTION",
+                               self.cmd_SET_TRACK_CARRIAGES_JUNCTION,
+                               desc=self.cmd_SET_TRACK_CARRIAGES_JUNCTION_help)
+        self.printer.register_event_handler("toolhead:update_extra_axes",
+                                            self._update_extra_axes)
     def _load_kinematics(self, config):
         primary_carriages = []
         for mcconfig in config.get_prefix_sections('carriage '):
@@ -343,6 +356,17 @@ class GenericCartesianKinematics:
     def _load_steppers(self, config, carriages):
         return [ks.KinematicStepper(c, carriages)
                 for c in config.get_prefix_sections('stepper ')]
+    def _update_extra_axes(self):
+        test_junction_axes_set = []
+        extra_axes = self.toolhead.get_extra_axes()
+        for tc in self.track_junction_carriages \
+                + self._default_junction_carriages:
+            axes = [extra_axes.index(c) if c in extra_axes else c.get_axis()
+                    for c in tc]
+            axes.sort()
+            if axes not in test_junction_axes_set:
+                test_junction_axes_set.append(axes)
+        self.test_junction_axes_set = test_junction_axes_set
     def get_steppers(self):
         return [s.get_stepper() for s in self.kin_steppers]
     def _get_kinematics_coeffs(self):
@@ -447,6 +471,9 @@ class GenericCartesianKinematics:
         z_ratio = move.move_d / abs(move.axes_d[2])
         move.limit_speed(
             self.max_z_velocity * z_ratio, self.max_z_accel * z_ratio)
+    def calc_junction(self, prev_move, move):
+        return min(move.calc_junction_v2(prev_move, axes, normalize=True)
+                   for axes in self.test_junction_axes_set)
     def process_move(self, print_time, move):
         self.dc_toolhead.process_move(print_time, move)
     def activate_dc_direct_mode(self, carriage_name, carriage_pos):
@@ -481,6 +508,39 @@ class GenericCartesianKinematics:
             'axis_minimum': axes_min,
             'axis_maximum': axes_max,
         }
+    cmd_SET_TRACK_CARRIAGES_JUNCTION_help = "Set up cornering tracking"
+    def cmd_SET_TRACK_CARRIAGES_JUNCTION(self, gcmd):
+        self.toolhead.flush_step_generation()
+        carriages_str = gcmd.get("CARRIAGES")
+        carriages_list = carriages_str.split(',')
+        if len(carriages_list) != 3:
+            raise gcmd.error(
+                    "CARRIAGES parameter must specify exactly 3 carriages")
+        carriages = []
+        for c_str in carriages_list:
+            c_name = c_str.strip().lower()
+            if c_name not in self.carriages:
+                raise gcmd.error("Invalid carriage '%s' specified" % c_name)
+            carriages.append(self.carriages[c_name])
+        carriages.sort(key=lambda c: c.get_axis())
+        for _, c_by_axis in itertools.groupby(carriages,
+                                              key=lambda c: c.get_axis()):
+            c_by_axis = list(c_by_axis)
+            if len(c_by_axis) > 1:
+                raise gcmd.error("Carriages %s share the same cartesian axis"
+                                 % ', '.join(c.get_name() for c in c_by_axis))
+        enable = gcmd.get_int("ENABLE", 1)
+        if enable:
+            if carriages not in self.track_junction_carriages and \
+                    carriages not in self._default_junction_carriages:
+                self.track_junction_carriages.append(carriages)
+        else:
+            if carriages in self.track_junction_carriages:
+                self.track_junction_carriages.remove(carriages)
+            else:
+                raise gcmd.error(
+                        "Cannot disable junction tracking for CARRIAGES=%s"
+                        % carriages_str)
     cmd_SET_STEPPER_CARRIAGES_help = "Set stepper carriages"
     def cmd_SET_STEPPER_CARRIAGES(self, gcmd):
         self.toolhead.flush_step_generation()
