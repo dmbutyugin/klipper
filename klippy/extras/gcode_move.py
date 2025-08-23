@@ -14,7 +14,8 @@ class GCodeMove:
         handlers = [
             'G1', 'G20', 'G21',
             'M82', 'M83', 'G90', 'G91', 'G92', 'M220', 'M221',
-            'SET_GCODE_OFFSET', 'SAVE_GCODE_STATE', 'RESTORE_GCODE_STATE',
+            'SET_GCODE_OFFSET', 'SET_GCODE_POSITION',
+            'SAVE_GCODE_STATE', 'RESTORE_GCODE_STATE',
         ]
         for cmd in handlers:
             func = getattr(self, 'cmd_' + cmd)
@@ -127,8 +128,16 @@ class GCodeMove:
                 or gcode_id in axis_map or gcode_id in "FN"):
                 continue
             axis_map[gcode_id] = index
+        base_position = [0.] * len(extra_axes)
+        for index, ea in enumerate(extra_axes):
+            if ea is None:
+                continue
+            gcode_id = ea.get_axis_gcode_id()
+            if gcode_id in self.axis_map:
+                base_position[index] = self.base_position[
+                        self.axis_map[gcode_id]]
         self.axis_map = axis_map
-        self.base_position[4:] = [0.] * (len(extra_axes) - 4)
+        self.base_position[4:] = base_position[4:]
         self.reset_last_position()
     # G-Code movement commands
     def cmd_G1(self, gcmd):
@@ -206,30 +215,42 @@ class GCodeMove:
         self.extrude_factor = new_extrude_factor
     cmd_SET_GCODE_OFFSET_help = "Set a virtual offset to g-code positions"
     def cmd_SET_GCODE_OFFSET(self, gcmd):
-        move_delta = [0., 0., 0., 0.]
-        for pos, axis in enumerate('XYZE'):
+        move_delta = [0.] * len(self.axis_map)
+        for axis, pos in self.axis_map.items():
+            homing_pos = self.homing_position[pos] if pos < 3 else 0.
             offset = gcmd.get_float(axis, None)
             if offset is None:
                 offset = gcmd.get_float(axis + '_ADJUST', None)
                 if offset is None:
                     continue
-                offset += self.homing_position[pos]
-            delta = offset - self.homing_position[pos]
+                offset += homing_pos
+            delta = offset - homing_pos
             move_delta[pos] = delta
             self.base_position[pos] += delta
-            self.homing_position[pos] = offset
+            if pos < 3:
+                self.homing_position[pos] = offset
         # Move the toolhead the given offset if requested
         if gcmd.get_int('MOVE', 0):
             speed = gcmd.get_float('MOVE_SPEED', self.speed, above=0.)
-            for pos, delta in enumerate(move_delta):
-                self.last_position[pos] += delta
+            for axis, pos in self.axis_map.items():
+                self.last_position[pos] += move_delta[pos]
             self.move_with_transform(self.last_position, speed)
+    cmd_SET_GCODE_POSITION_help = "Set positions for g-code axes"
+    def cmd_SET_GCODE_POSITION(self, gcmd):
+        for axis, pos in self.axis_map.items():
+            axis_position = gcmd.get_float(axis, None)
+            if axis_position is None:
+                continue
+            if pos == 3:
+                axis_position *= self.extrude_factor
+            self.base_position[pos] = self.last_position[pos] - axis_position
     cmd_SAVE_GCODE_STATE_help = "Save G-Code coordinate state"
     def cmd_SAVE_GCODE_STATE(self, gcmd):
         state_name = gcmd.get('NAME', 'default')
         self.saved_states[state_name] = {
             'absolute_coord': self.absolute_coord,
             'absolute_extrude': self.absolute_extrude,
+            'axis_map': dict(self.axis_map),
             'base_position': list(self.base_position),
             'last_position': list(self.last_position),
             'homing_position': list(self.homing_position),
@@ -242,6 +263,7 @@ class GCodeMove:
         state = self.saved_states.get(state_name)
         if state is None:
             raise gcmd.error("Unknown g-code state: %s" % (state_name,))
+        move_requested = gcmd.get_int('MOVE', 0)
         # Restore state
         self.absolute_coord = state['absolute_coord']
         self.absolute_extrude = state['absolute_extrude']
@@ -253,8 +275,17 @@ class GCodeMove:
         # Restore the relative E position
         e_diff = self.last_position[3] - state['last_position'][3]
         self.base_position[3] += e_diff
+        saved_axis_map = state['axis_map']
+        extra_axes = self.printer.lookup_object('toolhead').get_extra_axes()
+        for ea_id, index in self.axis_map:
+            if ea_id not in saved_axis_map:
+                continue
+            saved_index = saved_axis_map[ea_id]
+            self.base_position[index] = state['base_position'][saved_index]
+            if move_requested:
+                self.last_position[index] = state['last_position'][saved_index]
         # Move the toolhead back if requested
-        if gcmd.get_int('MOVE', 0):
+        if move_requested:
             speed = gcmd.get_float('MOVE_SPEED', self.speed, above=0.)
             self.last_position[:3] = state['last_position'][:3]
             self.move_with_transform(self.last_position, speed)
