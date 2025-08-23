@@ -141,6 +141,7 @@ class PrinterExtruder:
     def __init__(self, config, extruder_num):
         self.printer = config.get_printer()
         self.name = config.get_name()
+        self.gcode_axis = 'E'
         self.last_position = 0.
         # Setup hotend heater
         pheaters = self.printer.load_object(config, 'heaters')
@@ -180,10 +181,11 @@ class PrinterExtruder:
             or config.get('rotation_distance', None) is not None):
             self.extruder_stepper = ExtruderStepper(config)
             self.extruder_stepper.stepper.set_trapq(self.trapq)
+            self.extruder_stepper.motion_queue = self.name
         # Register commands
         gcode = self.printer.lookup_object('gcode')
         if self.name == 'extruder':
-            toolhead.set_extruder(self, 0.)
+            toolhead.update_extra_axis(self, 0.)
             gcode.register_command("M104", self.cmd_M104)
             gcode.register_command("M109", self.cmd_M109)
         gcode.register_mux_command("ACTIVATE_EXTRUDER", "EXTRUDER",
@@ -215,9 +217,11 @@ class PrinterExtruder:
     def get_trapq(self):
         return self.trapq
     def get_axis_gcode_id(self):
-        return 'E'
+        return self.gcode_axis
     def is_kinematic_axis(self):
         return False
+    def is_extruder_axis(self):
+        return True
     def stats(self, eventtime):
         return self.heater.stats(eventtime)
     def check_move(self, move, ea_index):
@@ -296,14 +300,36 @@ class PrinterExtruder:
         self.cmd_M104(gcmd, wait=True)
     cmd_ACTIVATE_EXTRUDER_help = "Change the active extruder"
     def cmd_ACTIVATE_EXTRUDER(self, gcmd):
+        gcode_axis = gcmd.get('GCODE_AXIS', self.gcode_axis).upper()
+        if self.name == 'extruder' and gcode_axis != 'E':
+            raise gcmd.error("Cannot remap GCode axis of the default extruder")
         toolhead = self.printer.lookup_object('toolhead')
-        if toolhead.get_extruder() is self:
+        extra_axes = toolhead.get_extra_axes()
+        if self in extra_axes and gcode_axis == self.gcode_axis:
             gcmd.respond_info("Extruder %s already active" % (self.name,))
             return
-        gcmd.respond_info("Activating extruder %s" % (self.name,))
+        if self.extruder_stepper is not None and \
+                self.extruder_stepper.motion_queue is not None and \
+                self.extruder_stepper.motion_queue != self.name:
+                    raise gcmd.error("Extruder %s is already syncing to %s" % (
+                        self.name, self.extruder_stepper.motion_queue))
+        if gcode_axis == '':
+            if self in extra_axes:
+                gcmd.respond_info("Deactivating extruder %s" % self.name)
+                toolhead.remove_extra_axis(self)
+            return
+        for ea in extra_axes:
+            if ea is None or ea.get_axis_gcode_id() != gcode_axis:
+                continue
+            if not ea.is_extruder_axis():
+                raise gcmd.error("GCODE_AXIS=%s is already in use" % gcode_axis)
+        gcmd.respond_info("Activating extruder %s%s" % (
+            self.name, (" as GCode axis %s" % gcode_axis
+                        if gcode_axis != 'E' else "")))
         toolhead.flush_step_generation()
-        toolhead.set_extruder(self, self.last_position)
-        self.printer.send_event("extruder:activate_extruder")
+        self.gcode_axis = gcode_axis
+        toolhead.update_extra_axis(self, self.last_position)
+        self.printer.send_event("extruder:activate_extruder", self)
 
 # Dummy extruder class used when a printer has no extruder at all
 class DummyExtruder:
@@ -325,6 +351,8 @@ class DummyExtruder:
         return 'E'
     def is_kinematic_axis(self):
         return False
+    def is_extruder_axis(self):
+        return True
 
 def add_printer_objects(config):
     printer = config.get_printer()

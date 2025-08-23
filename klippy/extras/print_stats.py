@@ -17,7 +17,7 @@ class PrintStats:
             desc=self.cmd_SET_PRINT_STATS_INFO_help)
         printer.register_event_handler("extruder:activate_extruder",
                                        self._handle_activate_extruder)
-    def _handle_activate_extruder(self):
+    def _handle_activate_extruder(self, extruder):
         gc_status = self.gcode_move.get_status()
         self.last_epos = gc_status['position'].e
     def _update_filament_usage(self, eventtime):

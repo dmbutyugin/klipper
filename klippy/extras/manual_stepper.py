@@ -199,6 +199,8 @@ class ManualStepper:
         return self.axis_gcode_id
     def is_kinematic_axis(self):
         return False
+    def is_extruder_axis(self):
+        return False
     def get_trapq(self):
         return self.trapq
     # Toolhead wrappers to support homing

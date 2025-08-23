@@ -83,6 +83,7 @@ class ExcludeObject:
         self._unregister_transform()
 
     def _get_extrusion_offsets(self, num_coord):
+        # TODO: Consider supporting multiple extruders on different GCode axes
         ename = self.toolhead.get_extruder().get_name()
         offset = self.extrusion_offsets.get(ename)
         if offset is None:

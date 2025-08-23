@@ -369,7 +369,7 @@ class GCodeStream:
             out.append('; Must manually set homing position...')
         if abs(kv['speed_factor'] - 1. / 60.) > .000001:
             out.append('M220 S%f' % (kv['speed_factor'] * 60. * 100.,))
-        if kv['extrude_factor'] != 1.:
+        if kv['extrude_factors']['E'] != 1.:
             out.append('M221 S%f' % (kv['extrude_factor'] * 100.,))
         out.extend(['; End of state restore', '', ''])
         self.gcode_state = '\n'.join(out)
