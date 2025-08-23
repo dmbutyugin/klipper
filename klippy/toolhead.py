@@ -463,11 +463,6 @@ class ToolHead:
         for e_index, ea in enumerate(self.extra_axes):
             if ea.is_kinematic_axis():
                 self.kin_axes_map[e_index + 3] = ea.get_axis()
-    def set_extruder(self, extruder, extrude_pos):
-        # XXX - should use add_extra_axis
-        self.extra_axes[0] = extruder
-        self.commanded_pos[3] = extrude_pos
-        self._rebuild_extra_axes()
     def get_extruder(self):
         return self.extra_axes[0]
     def add_extra_axis(self, ea, axis_pos):
@@ -483,6 +478,18 @@ class ToolHead:
         ea_index = self.extra_axes.index(ea) + 3
         self.commanded_pos.pop(ea_index)
         self.extra_axes.pop(ea_index - 3)
+        self._rebuild_extra_axes()
+        self.printer.send_event("toolhead:update_extra_axes")
+    def update_extra_axis(self, ea, axis_pos):
+        self._flush_lookahead()
+        same_axis = [ex_ea for ex_ea in self.extra_axes
+                     if ea.get_axis_gcode_id() == ex_ea.get_axis_gcode_id()]
+        if not same_axis:
+            self.add_extra_axis(ea, axis_pos)
+            return
+        ea_index = self.extra_axes.index(same_axis[0])
+        self.extra_axes[ea_index] = ea
+        self.commanded_pos[ea_index + 3] = axis_pos
         self._rebuild_extra_axes()
         self.printer.send_event("toolhead:update_extra_axes")
     def get_extra_axes(self):

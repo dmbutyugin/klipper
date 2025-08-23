@@ -34,7 +34,7 @@ class GCodeMove:
         self.axis_map = {'X':0, 'Y': 1, 'Z': 2, 'E': 3}
         self.speed = 25.
         self.speed_factor = 1. / 60.
-        self.extrude_factor = 1.
+        self.extrude_factors = {'E': 1.}
         # G-Code state
         self.saved_states = {}
         self.move_transform = self.move_with_transform = None
@@ -68,15 +68,19 @@ class GCodeMove:
     def _handle_analyze_shutdown(self, msg, details):
         logging.info("gcode state: absolute_coord=%s absolute_extrude=%s"
                      " base_position=%s last_position=%s homing_position=%s"
-                     " speed_factor=%s extrude_factor=%s speed=%s",
+                     " speed_factor=%s extrude_factors={%s} speed=%s",
                      self.absolute_coord, self.absolute_extrude,
                      self.base_position, self.last_position,
                      self.homing_position, self.speed_factor,
-                     self.extrude_factor, self.speed)
-    def _handle_activate_extruder(self):
+                     ','.join(["'%s':%f" % (a, f)
+                               for a, f in self.extrude_factors.items()]),
+                     self.speed)
+    def _handle_activate_extruder(self, extruder):
         self.reset_last_position()
-        self.extrude_factor = 1.
-        self.base_position[3] = self.last_position[3]
+        gcode_id = extruder.get_axis_gcode_id()
+        self.extrude_factors[gcode_id] = 1.
+        pos = self.axis_map[gcode_id]
+        self.base_position[pos] = self.last_position[pos]
     def _handle_home_rails_end(self, homing_state, rails):
         self.reset_last_position()
         for axis in homing_state.get_axes():
@@ -94,7 +98,8 @@ class GCodeMove:
         return old_transform
     def _get_gcode_position(self):
         p = [lp - bp for lp, bp in zip(self.last_position, self.base_position)]
-        p[3] /= self.extrude_factor
+        for axis, factor in self.extrude_factors.items():
+            p[self.axis_map[axis]] /= factor
         return p
     def _get_gcode_speed(self):
         return self.speed / self.speed_factor
@@ -105,7 +110,9 @@ class GCodeMove:
         return {
             'speed_factor': self._get_gcode_speed_override(),
             'speed': self._get_gcode_speed(),
-            'extrude_factor': self.extrude_factor,
+            'extrude_factor': self.extrude_factors['E'],
+            'extrude_factors': { a.lower() : f
+                                for a, f in self.extrude_factors.items()},
             'absolute_coordinates': self.absolute_coord,
             'absolute_extrude': self.absolute_extrude,
             'homing_origin': self.Coord(self.homing_position),
@@ -137,7 +144,10 @@ class GCodeMove:
                 base_position[index] = self.base_position[
                         self.axis_map[gcode_id]]
         self.axis_map = axis_map
-        self.base_position[4:] = base_position[4:]
+        self.base_position[3:] = base_position[3:]
+        for axis in tuple(self.extrude_factors.keys()):
+            if axis not in axis_map:
+                del self.extrude_factors[axis]
         self.reset_last_position()
     # G-Code movement commands
     def cmd_G1(self, gcmd):
@@ -148,8 +158,8 @@ class GCodeMove:
                 if axis in params:
                     v = float(params[axis])
                     absolute_coord = self.absolute_coord
-                    if axis == 'E':
-                        v *= self.extrude_factor
+                    if axis in self.extrude_factors:
+                        v *= self.extrude_factors[axis]
                         if not self.absolute_extrude:
                             absolute_coord = False
                     if not absolute_coord:
@@ -193,7 +203,7 @@ class GCodeMove:
         for i, offset in enumerate(offsets):
             if offset is not None:
                 if i == 3:
-                    offset *= self.extrude_factor
+                    offset *= self.extrude_factors['E']
                 self.base_position[i] = self.last_position[i] - offset
         if offsets == [None, None, None, None]:
             self.base_position[:4] = self.last_position[:4]
@@ -209,10 +219,29 @@ class GCodeMove:
     def cmd_M221(self, gcmd):
         # Set extrude factor override percentage
         new_extrude_factor = gcmd.get_float('S', 100., above=0.) / 100.
-        last_e_pos = self.last_position[3]
-        e_value = (last_e_pos - self.base_position[3]) / self.extrude_factor
-        self.base_position[3] = last_e_pos - e_value * new_extrude_factor
-        self.extrude_factor = new_extrude_factor
+        toolhead = self.printer.lookup_object('toolhead')
+        index = gcmd.get_int('T', None, minval=0)
+        if index is not None:
+            section = 'extruder'
+            if index:
+                section = 'extruder%d' % (index,)
+            extruder = self.printer.lookup_object(section, None)
+            if extruder is None:
+                if temp <= 0.:
+                    return
+                raise gcmd.error("Extruder not configured")
+        else:
+            extruder = toolhead.get_extruder()
+        extra_axes = toolhead.get_extra_axes()
+        if extruder not in extra_axes:
+            return
+        ea_index = extra_axes.index(extruder)
+        gcode_id = extruder.get_axis_gcode_id()
+        last_e_pos = self.last_position[ea_index]
+        extrude_factor = self.extrude_factors[gcode_id]
+        e_value = (last_e_pos - self.base_position[ea_index]) / extrude_factor
+        self.base_position[ea_index] = last_e_pos - e_value * new_extrude_factor
+        self.extrude_factors[gcode_id] = new_extrude_factor
     cmd_SET_GCODE_OFFSET_help = "Set a virtual offset to g-code positions"
     def cmd_SET_GCODE_OFFSET(self, gcmd):
         move_delta = [0.] * len(self.axis_map)
@@ -241,8 +270,8 @@ class GCodeMove:
             axis_position = gcmd.get_float(axis, None)
             if axis_position is None:
                 continue
-            if pos == 3:
-                axis_position *= self.extrude_factor
+            if axis in self.extrude_factors:
+                axis_position *= self.extrude_factors[axis]
             self.base_position[pos] = self.last_position[pos] - axis_position
     cmd_SAVE_GCODE_STATE_help = "Save G-Code coordinate state"
     def cmd_SAVE_GCODE_STATE(self, gcmd):
@@ -255,7 +284,7 @@ class GCodeMove:
             'last_position': list(self.last_position),
             'homing_position': list(self.homing_position),
             'speed': self.speed, 'speed_factor': self.speed_factor,
-            'extrude_factor': self.extrude_factor,
+            'extrude_factors': dict(self.extrude_factors),
         }
     cmd_RESTORE_GCODE_STATE_help = "Restore a previously saved G-Code state"
     def cmd_RESTORE_GCODE_STATE(self, gcmd):
@@ -271,16 +300,24 @@ class GCodeMove:
         self.homing_position = list(state['homing_position'])
         self.speed = state['speed']
         self.speed_factor = state['speed_factor']
-        self.extrude_factor = state['extrude_factor']
-        # Restore the relative E position
-        e_diff = self.last_position[3] - state['last_position'][3]
-        self.base_position[3] += e_diff
         saved_axis_map = state['axis_map']
         extra_axes = self.printer.lookup_object('toolhead').get_extra_axes()
-        for ea_id, index in self.axis_map:
-            if ea_id not in saved_axis_map:
+        for index, ea in enumerate(extra_axes):
+            if ea is None:
                 continue
-            saved_index = saved_axis_map[ea_id]
+            gcode_id = ea.get_axis_gcode_id()
+            if gcode_id is None or gcode_id not in saved_axis_map:
+                continue
+            saved_index = saved_axis_map[gcode_id]
+            if ea.is_extruder_axis():
+                # Restore the relative E position
+                e_diff = self.last_position[index] \
+                        - state['last_position'][saved_index]
+                self.base_position[index] += e_diff
+                if gcode_id in state['extrude_factors']:
+                    self.extrude_factors[gcode_id] = \
+                            state['extrude_factors'][gcode_id]
+                continue
             self.base_position[index] = state['base_position'][saved_index]
             if move_requested:
                 self.last_position[index] = state['last_position'][saved_index]

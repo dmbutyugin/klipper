@@ -156,6 +156,8 @@ class DualCarriage:
         return self.get_name().upper()
     def is_kinematic_axis(self):
         return True
+    def is_extruder_axis(self):
+        return False
     def check_move(self, move, ea_index):
         axis = self.axis
         if not move.axes_d[ea_index] and not move.axes_d[axis]:
