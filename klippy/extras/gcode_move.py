@@ -333,19 +333,31 @@ class GCodeMove:
         if toolhead is None:
             raise gcmd.error("Printer not ready")
         kin = toolhead.get_kinematics()
+        extra_axes = toolhead.get_extra_axes()
         steppers = kin.get_steppers()
         mcu_pos = " ".join(["%s:%d" % (s.get_name(), s.get_mcu_position())
                             for s in steppers])
         cinfo = [(s.get_name(), s.get_commanded_position()) for s in steppers]
         stepper_pos = " ".join(["%s:%.6f" % (a, v) for a, v in cinfo])
-        kinfo = zip("XYZ", kin.calc_position(dict(cinfo)))
+        kin_axes = ["X", "Y", "Z"] + [ea.get_axis_gcode_id()
+                                      for ea in extra_axes
+                                      if ea and ea.is_kinematic_axis()]
+        kinfo = zip(kin_axes, kin.calc_position(dict(cinfo)))
         kin_pos = " ".join(["%s:%.6f" % (a, v) for a, v in kinfo])
-        toolhead_pos = " ".join(["%s:%.6f" % (a, v) for a, v in zip(
-            "XYZE", toolhead.get_position()[:4])])
+        toolhead_axes = [("XYZ"[i] if i < 3 else ea.get_axis_gcode_id(), i)
+                         for i, ea in enumerate(extra_axes)
+                         if i < 3 or (ea and (ea.is_kinematic_axis()
+                                              or ea.is_extruder_axis()))]
+        tpos = toolhead.get_position()
+        toolhead_pos = " ".join(["%s:%.6f" % (a, tpos[i])
+                                 for a, i in toolhead_axes])
+        gcode_axes = [" "] * len(self.axis_map)
+        for a, i in self.axis_map.items():
+            gcode_axes[i] = a
         gcode_pos = " ".join(["%s:%.6f"  % (a, v)
-                              for a, v in zip("XYZE", self.last_position)])
+                              for a, v in zip(gcode_axes, self.last_position)])
         base_pos = " ".join(["%s:%.6f"  % (a, v)
-                             for a, v in zip("XYZE", self.base_position)])
+                             for a, v in zip(gcode_axes, self.base_position)])
         homing_pos = " ".join(["%s:%.6f"  % (a, v)
                                for a, v in zip("XYZ", self.homing_position)])
         gcmd.respond_info("mcu: %s\n"
