@@ -67,8 +67,11 @@ class Move:
         self.next_junction_v2 = min(self.next_junction_v2, speed**2)
     def move_error(self, msg="Move out of range"):
         ep = self.end_pos
-        m = "%s: %.3f %.3f %.3f [%.3f]" % (msg, ep[0], ep[1], ep[2], ep[3])
-        return self.toolhead.printer.command_error(m)
+        pos_msg = ' '.join([
+            '%s%.3f' % ('XYZ'[ea_index] if ea is None
+                        else ea.get_axis_gcode_id(), ep[ea_index])
+            for ea_index, ea in enumerate(self.toolhead.get_extra_axes())])
+        return self.toolhead.printer.command_error("%s: %s" % (msg, pos_msg))
     def calc_junction_v2(self, prev_move, axes=(0, 1, 2), normalize=False):
         # Find max velocity using "approximated centripetal velocity"
         axes_r = self.axes_r
