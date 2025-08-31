@@ -30,7 +30,7 @@ class GCodeMove:
         self.absolute_coord = self.absolute_extrude = True
         self.base_position = [0.0, 0.0, 0.0, 0.0]
         self.last_position = [0.0, 0.0, 0.0, 0.0]
-        self.homing_position = [0.0, 0.0, 0.0, 0.0]
+        self.homing_position = [0.0, 0.0, 0.0]
         self.axis_map = {'X':0, 'Y': 1, 'Z': 2, 'E': 3}
         self.speed = 25.
         self.speed_factor = 1. / 60.
@@ -149,6 +149,11 @@ class GCodeMove:
             if axis not in axis_map:
                 del self.extrude_factors[axis]
         self.reset_last_position()
+    def _get_gcode_axes(self):
+        gcode_axes = ["?"] * len(self.axis_map)
+        for a, i in self.axis_map.items():
+            gcode_axes[i] = a
+        return gcode_axes
     # G-Code movement commands
     def cmd_G1(self, gcmd):
         # Move
@@ -210,7 +215,8 @@ class GCodeMove:
     def cmd_M114(self, gcmd):
         # Get Current Position
         p = self._get_gcode_position()
-        gcmd.respond_raw("X:%.3f Y:%.3f Z:%.3f E:%.3f" % tuple(p[:4]))
+        axes = self._get_gcode_axes()
+        gcmd.respond_raw(" ".join("%s:%.3f" % (a, v) for a, v in zip(axes, p)))
     def cmd_M220(self, gcmd):
         # Set speed factor override percentage
         value = gcmd.get_float('S', 100., above=0.) / (60. * 100.)
@@ -351,9 +357,7 @@ class GCodeMove:
         tpos = toolhead.get_position()
         toolhead_pos = " ".join(["%s:%.6f" % (a, tpos[i])
                                  for a, i in toolhead_axes])
-        gcode_axes = [" "] * len(self.axis_map)
-        for a, i in self.axis_map.items():
-            gcode_axes[i] = a
+        gcode_axes = self._get_gcode_axes()
         gcode_pos = " ".join(["%s:%.6f"  % (a, v)
                               for a, v in zip(gcode_axes, self.last_position)])
         base_pos = " ".join(["%s:%.6f"  % (a, v)

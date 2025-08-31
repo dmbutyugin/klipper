@@ -27,10 +27,46 @@ def mat_transp(a):
         res.append([a[j][i] for j in range(len(a))])
     return res
 
+def mat_solve(a, rhs):
+    res = copy.deepcopy(rhs)
+    m = copy.deepcopy(a)
+    n = len(m)
+    # Perform the LU-decomposition through Gaussian elimination
+    for i in range(n):
+        # Find a pivot and swap the corresponding rows
+        abs_col = [abs(m[j][i]) for j in range(i, n)]
+        j = abs_col.index(max(abs_col)) + i
+        if i != j:
+            m[i], m[j] = m[j], m[i]
+            res[i], res[j] = res[j], res[i]
+
+        # Scale the i-th row
+        recipr = 1. / m[i][i]
+        for j in range(i+1, n):
+            m[i][j] *= recipr
+        for j in range(len(res[i])):
+            res[i][j] *= recipr
+        m[i][i] = 1.
+
+        # Zero-out the i-th column after the row i
+        for j in range(i+1, n):
+            c = m[j][i]
+            for k in range(i, n):
+                m[j][k] -= c * m[i][k]
+            for k in range(len(res[j])):
+                res[j][k] -= c * res[i][k]
+
+    # Solve the system with the upper-triangular matrix
+    for i in range(n-2, -1, -1):
+        for j in range(i+1, n):
+            for k in range(len(res[j])):
+                res[i][k] -= m[i][j] * res[j][k]
+    return res
+
 def mat_pseudo_inverse(m):
     mt = mat_transp(m)
     mtm = mat_mul(mt, m)
-    pinv = mat_mul(mathutil.matrix_inv(mtm), mt)
+    pinv = mat_solve(mtm, mt)
     return pinv
 
 class MainCarriage:
@@ -372,9 +408,13 @@ class GenericCartesianKinematics:
     def get_steppers(self):
         return [s.get_stepper() for s in self.kin_steppers]
     def _get_kinematics_coeffs(self):
-        matr = {s.get_name() : list(s.get_kin_coeffs())
+        extra_kin_carriages = []
+        if self.dc_toolhead is not None:
+            extra_kin_carriages = self.dc_toolhead.get_active_carriages()
+        n = 3 + len(extra_kin_carriages)
+        matr = {s.get_name() : list(s.get_kin_coeffs()) + [0.] * (n-3)
                 for s in self.kin_steppers}
-        offs = {s.get_name() : [0.] * 3 for s in self.kin_steppers}
+        offs = {s.get_name() : [0.] * n for s in self.kin_steppers}
         if self.dc_module is None:
             return ([matr[s.get_name()] for s in self.kin_steppers],
                     [0. for s in self.kin_steppers])
@@ -385,8 +425,15 @@ class GenericCartesianKinematics:
             if axis in self.dc_module.get_axes():
                 m, o = self.dc_module.get_transform(c.get_rail())
                 for s in c.get_rail().get_steppers():
-                    matr[s.get_name()][axis] *= m
-                    offs[s.get_name()][axis] += o
+                    sname = s.get_name()
+                    if c in extra_kin_carriages:
+                        index = 3 + extra_kin_carriages.index(c)
+                        matr[sname][index] = m * matr[sname][axis]
+                        offs[sname][index] += o + offs[sname][axis]
+                        matr[sname][axis] = offs[sname][axis] = 0.
+                    else:
+                        matr[sname][axis] *= m
+                        offs[sname][axis] += o
         return ([matr[s.get_name()] for s in self.kin_steppers],
                 [mathutil.matrix_dot(orig_matr[s.get_name()],
                                      offs[s.get_name()])
@@ -404,7 +451,7 @@ class GenericCartesianKinematics:
         spos = [stepper_positions[s.get_name()] for s in self.kin_steppers]
         pinv = mat_pseudo_inverse(matr)
         pos = mat_mul([[sp-o for sp, o in zip(spos, offs)]], mat_transp(pinv))
-        for i in range(3):
+        for i in range(len(pinv)):
             if not any(pinv[i]):
                 pos[0][i] = None
         return pos[0]
