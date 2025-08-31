@@ -350,9 +350,13 @@ class GenericCartesianKinematics:
     def get_steppers(self):
         return [s.get_stepper() for s in self.kin_steppers]
     def _get_kinematics_coeffs(self):
-        matr = {s.get_name() : list(s.get_kin_coeffs())
+        extra_kin_carriages = []
+        if self.dc_toolhead is not None:
+            extra_kin_carriages = self.dc_toolhead.get_active_carriages()
+        n = 3 + len(extra_kin_carriages)
+        matr = {s.get_name() : list(s.get_kin_coeffs()) + [0.] * (n-3)
                 for s in self.kin_steppers}
-        offs = {s.get_name() : [0.] * 3 for s in self.kin_steppers}
+        offs = {s.get_name() : [0.] * n for s in self.kin_steppers}
         if self.dc_module is None:
             return ([matr[s.get_name()] for s in self.kin_steppers],
                     [0. for s in self.kin_steppers])
@@ -363,8 +367,15 @@ class GenericCartesianKinematics:
             if axis in self.dc_module.get_axes():
                 m, o = self.dc_module.get_transform(c.get_rail())
                 for s in c.get_rail().get_steppers():
-                    matr[s.get_name()][axis] *= m
-                    offs[s.get_name()][axis] += o
+                    sname = s.get_name()
+                    if c in extra_kin_carriages:
+                        index = 3 + extra_kin_carriages.index(c)
+                        matr[sname][index] = m * matr[sname][axis]
+                        offs[sname][index] += o + offs[sname][axis]
+                        matr[sname][axis] = offs[sname][axis] = 0.
+                    else:
+                        matr[sname][axis] *= m
+                        offs[sname][axis] += o
         return ([matr[s.get_name()] for s in self.kin_steppers],
                 [mathutil.matrix_dot(orig_matr[s.get_name()],
                                      offs[s.get_name()])
