@@ -99,6 +99,9 @@ class DualCarriages:
     def is_active(self, rail):
         dc_rail = self.get_dc_rail_wrapper(rail)
         return dc_rail.is_active() if dc_rail is not None else False
+    def get_mode(self, rail):
+        dc_rail = self.get_dc_rail_wrapper(rail)
+        return dc_rail.mode if dc_rail is not None else None
     def toggle_active_dc_rail(self, target_dc):
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.flush_step_generation()
@@ -413,6 +416,7 @@ class DualCarriagesRail:
         self.printer.send_event('dual_carriage:update_kinematics')
     def activate(self, mode, position, old_position=None):
         old_axis_position = self.get_axis_position(old_position or position)
+        self.mode = mode
         self.scale = -1. if mode == MIRROR else 1.
         if mode == DIRECT:
             self.offset = 0.
@@ -423,16 +427,15 @@ class DualCarriagesRail:
         else:
             self.offset = old_axis_position - position[self.axis] * self.scale
         self.apply_transform()
-        self.mode = mode
     def inactivate(self, position):
         self.offset = self.get_axis_position(position)
+        prev_mode, self.mode = self.mode, INACTIVE
         self.scale = 0.
-        if self.mode == DIRECT:
+        if prev_mode == DIRECT:
             toolhead = self.printer.lookup_object('toolhead')
             kin = toolhead.get_kinematics()
             kin.deactivate_dc_direct_mode(self.rail.get_name(short=True))
         self.apply_transform()
-        self.mode = INACTIVE
     def override_axis_scaling(self, new_scale, position):
         old_axis_position = self.get_axis_position(position)
         self.scale = math.copysign(new_scale, self.scale)

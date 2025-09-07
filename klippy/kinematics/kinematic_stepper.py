@@ -72,7 +72,7 @@ class KinematicStepper:
     def get_active_axes(self):
         return [i for i, c in enumerate(self.kin_coeffs) if c]
     def get_carriages(self):
-        return self.carriages
+        return tuple(self.carriages)
     def update_kin_coeffs(self, kin_coeffs):
         self.kin_coeffs = kin_coeffs
         ffi_main, ffi_lib = chelper.get_ffi()
