@@ -285,6 +285,16 @@ class DualCarriages:
                 raise gcmd.error(
                         "Cannot deactivate the only active carriage for axis %s"
                         % 'XYZ'[dc_rail.axis])
+        elif mode == DIRECT:
+            gcode_move = self.printer.lookup_object('gcode_move')
+            new_axis_name = dc_rail.rail.get_name(short=True)
+            if len(new_axis_name) != 1 or \
+                    new_axis_name in gcode_move.get_invalid_gcode_axes():
+                raise gcmd.error("Cannot activate DIRECT mode for carriage "
+                                 "%s: invalid GCode axis" % new_axis_name)
+            if new_axis_name.upper() in gcode_move.get_gcode_axes():
+                raise gcmd.error("Cannot activate DIRECT mode for carriage "
+                                 "%s: axis already in use" % new_axis_name)
         self.activate_dc_mode(dc_rail, mode)
     cmd_SAVE_DUAL_CARRIAGE_STATE_help = \
             "Save dual carriages modes and positions"
