@@ -127,12 +127,13 @@ class GCodeMove:
         toolhead = self.printer.lookup_object('toolhead')
         axis_map = {'X':0, 'Y': 1, 'Z': 2, 'E': 3}
         extra_axes = toolhead.get_extra_axes()
+        invalid_gcode_axes = self.get_invalid_gcode_axes()
         for index, ea in enumerate(extra_axes):
             if ea is None:
                 continue
             gcode_id = ea.get_axis_gcode_id()
             if (gcode_id is None or len(gcode_id) != 1 or not gcode_id.isupper()
-                or gcode_id in axis_map or gcode_id in "FN"):
+                or gcode_id in axis_map or gcode_id in invalid_gcode_axes):
                 continue
             axis_map[gcode_id] = index
         base_position = [0.] * len(extra_axes)
@@ -149,11 +150,13 @@ class GCodeMove:
             if axis not in axis_map:
                 del self.extrude_factors[axis]
         self.reset_last_position()
-    def _get_gcode_axes(self):
+    def get_gcode_axes(self):
         gcode_axes = ["?"] * len(self.axis_map)
         for a, i in self.axis_map.items():
             gcode_axes[i] = a
         return gcode_axes
+    def get_invalid_gcode_axes(self):
+        return "FN"
     # G-Code movement commands
     def cmd_G1(self, gcmd):
         # Move
@@ -215,7 +218,7 @@ class GCodeMove:
     def cmd_M114(self, gcmd):
         # Get Current Position
         p = self._get_gcode_position()
-        axes = self._get_gcode_axes()
+        axes = self.get_gcode_axes()
         gcmd.respond_raw(" ".join("%s:%.3f" % (a, v) for a, v in zip(axes, p)))
     def cmd_M220(self, gcmd):
         # Set speed factor override percentage
@@ -357,7 +360,7 @@ class GCodeMove:
         tpos = toolhead.get_position()
         toolhead_pos = " ".join(["%s:%.6f" % (a, tpos[i])
                                  for a, i in toolhead_axes])
-        gcode_axes = self._get_gcode_axes()
+        gcode_axes = self.get_gcode_axes()
         gcode_pos = " ".join(["%s:%.6f"  % (a, v)
                               for a, v in zip(gcode_axes, self.last_position)])
         base_pos = " ".join(["%s:%.6f"  % (a, v)
