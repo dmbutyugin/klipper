@@ -300,14 +300,17 @@ class PrinterExtruder:
         self.cmd_M104(gcmd, wait=True)
     cmd_ACTIVATE_EXTRUDER_help = "Change the active extruder"
     def cmd_ACTIVATE_EXTRUDER(self, gcmd):
-        gcode_axis = gcmd.get('GCODE_AXIS', self.gcode_axis).upper()
-        if self.name == 'extruder' and gcode_axis != 'E':
-            raise gcmd.error("Cannot remap GCode axis of the default extruder")
+        gcode_axis = gcmd.get('GCODE_AXIS', self.gcode_axis)
+        if gcode_axis and (len(gcode_axis) != 1 or not gcode_axis.isupper() or
+                           gcode_axis in "XYZFN"):
+            raise gcmd.error("Not a valid GCODE_AXIS=%s" % gcode_axis)
         toolhead = self.printer.lookup_object('toolhead')
         extra_axes = toolhead.get_extra_axes()
         if self in extra_axes and gcode_axis == self.gcode_axis:
             gcmd.respond_info("Extruder %s already active" % (self.name,))
             return
+        if toolhead.get_extruder() == self and gcode_axis != 'E':
+            raise gcmd.error("Cannot unmap the active extruder of E axis")
         if self.extruder_stepper is not None and \
                 self.extruder_stepper.motion_queue is not None and \
                 self.extruder_stepper.motion_queue != self.name:
