@@ -100,6 +100,10 @@ class MainCarriage:
         self.dual_carriage = carriage
     def get_dual_carriage(self):
         return self.dual_carriage
+    def get_control_carriage(self):
+        if self.is_active():
+            return self
+        return self.dual_carriage
 
 class ExtraCarriage:
     def __init__(self, config, carriages):
@@ -115,6 +119,8 @@ class ExtraCarriage:
     def add_stepper(self, kin_stepper):
         self.get_rail().add_stepper(kin_stepper.get_stepper(),
                                     self.endstop_pin, self.name)
+    def get_control_carriage(self):
+        return self.primary_carriage.get_control_carriage()
 
 class DualCarriage:
     def __init__(self, config):
@@ -186,6 +192,13 @@ class DualCarriage:
         return self.primary_carriage
     def get_primary_carriage(self):
         return self.primary_carriage
+    def get_control_carriage(self):
+        if self.primary_carriage is None:
+            return self
+        mode = self.get_dc_module().get_mode(self.rail)
+        if mode == idex_modes.DIRECT or not self.primary_carriage.is_active():
+            return self
+        return self.primary_carriage
     def add_stepper(self, kin_stepper):
         self.rail.add_stepper(kin_stepper.get_stepper())
     def get_axis_gcode_id(self):
@@ -219,39 +232,27 @@ class DualCarriage:
         if end_pos < limits[0] or end_pos > limits[1]:
             raise move.move_error()
 
-class DCVirtualToolhead:
-    def __init__(self, config, toolhead):
-        self.printer = config.get_printer()
-        self.toolhead = toolhead
-        self.direct_dc_carriages = []
-        self.motion_queuing = self.printer.load_object(config, 'motion_queuing')
-        self.trapq = self.motion_queuing.allocate_trapq()
-        self.trapq_append = self.motion_queuing.lookup_trapq_append()
-    def get_active_carriages(self):
-        return self.direct_dc_carriages
-    def activate_direct_mode(self, dual_carriage, carriage_pos):
-        self.toolhead.add_extra_axis(dual_carriage, carriage_pos)
-        self.direct_dc_carriages.append(dual_carriage)
-        dual_carriage.get_rail().set_trapq(self.trapq)
-    def deactivate_direct_mode(self, dual_carriage):
-        if dual_carriage not in self.direct_dc_carriages:
-            return
-        self.toolhead.remove_extra_axis(dual_carriage)
-        self.direct_dc_carriages.remove(dual_carriage)
-        # Restore the trapq of the main toolhead for the steppers no longer
-        # associated with the carriages under direct control
-        dual_carriage.get_rail().set_trapq(self.toolhead.get_trapq())
-        for active_dc in self.direct_dc_carriages:
-            active_dc.get_rail().set_trapq(self.trapq)
+class MoveCarriageMapper:
+    def __init__(self, printer, carriages):
+        self.printer = printer
+        motion_queuing = printer.lookup_object('motion_queuing')
+        self.trapq = motion_queuing.allocate_trapq()
+        self.trapq_append = motion_queuing.lookup_trapq_append()
+        self.carriages = carriages
+    def update_carriage_axes(self):
+        toolhead = self.printer.lookup_object('toolhead')
+        extra_axes = toolhead.get_extra_axes()
+        self.axes_map = {extra_axes.index(c) if c in extra_axes
+                         else c.get_axis(): c.get_axis()
+                         for c in self.carriages}
+    def get_trapq(self):
+        return self.trapq
     def process_move(self, print_time, move):
-        extra_axes = self.toolhead.get_extra_axes()
-        axes_r = list(move.axes_r)
-        start_pos = list(move.start_pos)
-        for ea_index, ea in enumerate(extra_axes):
-            if ea in self.direct_dc_carriages:
-                dc_axis = ea.get_axis()
-                start_pos[dc_axis] = start_pos[ea_index]
-                axes_r[dc_axis] = axes_r[ea_index]
+        axes_r = [0.] * 3
+        start_pos = [0.] * 3
+        for i, o in self.axes_map.items():
+            start_pos[o] = move.start_pos[i]
+            axes_r[o] = move.axes_r[i]
         if not any(axes_r):
             return
         self.trapq_append(
@@ -260,6 +261,50 @@ class DCVirtualToolhead:
             start_pos[0], start_pos[1], start_pos[2],
             axes_r[0], axes_r[1], axes_r[2],
             move.start_v, move.cruise_v, move.accel)
+
+class DCVirtualToolhead:
+    def __init__(self, config, toolhead):
+        self.printer = config.get_printer()
+        self.toolhead = toolhead
+        self.direct_dc_carriages = []
+        self.move_mappers = {}
+        self.active_mappers = []
+    def get_direct_mode_carriages(self):
+        return self.direct_dc_carriages
+    def _update_stepper_trapqs(self):
+        kin = self.toolhead.get_kinematics()
+        toolhead_trapq = self.toolhead.get_trapq()
+        del self.active_mappers[:]
+        for ks in kin.kin_steppers:
+            control_carriages = tuple(sorted([c.get_control_carriage()
+                                              for c in ks.get_carriages()],
+                                             key=lambda c: c.get_axis()))
+            if not any(c in self.direct_dc_carriages
+                       for c in control_carriages):
+                ks.get_stepper().set_trapq(toolhead_trapq)
+                continue
+            if control_carriages not in self.move_mappers:
+                self.move_mappers[control_carriages] = MoveCarriageMapper(
+                        self.printer, control_carriages)
+            move_mapper = self.move_mappers[control_carriages]
+            ks.get_stepper().set_trapq(move_mapper.get_trapq())
+            if move_mapper not in self.active_mappers:
+                self.active_mappers.append(move_mapper)
+        for move_mapper in self.active_mappers:
+            move_mapper.update_carriage_axes()
+    def activate_direct_mode(self, dual_carriage, carriage_pos):
+        self.toolhead.add_extra_axis(dual_carriage, carriage_pos)
+        self.direct_dc_carriages.append(dual_carriage)
+        self._update_stepper_trapqs()
+    def deactivate_direct_mode(self, dual_carriage):
+        if dual_carriage not in self.direct_dc_carriages:
+            return
+        self.toolhead.remove_extra_axis(dual_carriage)
+        self.direct_dc_carriages.remove(dual_carriage)
+        self._update_stepper_trapqs()
+    def process_move(self, print_time, move):
+        for move_mapper in self.active_mappers:
+            move_mapper.process_move(print_time, move)
 
 class GenericCartesianKinematics:
     def __init__(self, toolhead, config):
@@ -410,7 +455,7 @@ class GenericCartesianKinematics:
     def _get_kinematics_coeffs(self):
         extra_kin_carriages = []
         if self.dc_toolhead is not None:
-            extra_kin_carriages = self.dc_toolhead.get_active_carriages()
+            extra_kin_carriages = self.dc_toolhead.get_direct_mode_carriages()
         n = 3 + len(extra_kin_carriages)
         matr = {s.get_name() : list(s.get_kin_coeffs()) + [0.] * (n-3)
                 for s in self.kin_steppers}
@@ -509,7 +554,8 @@ class GenericCartesianKinematics:
                 or end_pos[axis] > self.limits[axis][1]):
                 raise move.move_error()
             dc = c.get_dual_carriage()
-            if dc is not None and dc in self.dc_toolhead.get_active_carriages():
+            if dc is not None and \
+                    dc in self.dc_toolhead.get_direct_mode_carriages():
                 extra_axes = self.toolhead.get_extra_axes()
                 # Always check with the dual carriage even if it is not moving
                 dc.check_move(move, extra_axes.index(dc))
