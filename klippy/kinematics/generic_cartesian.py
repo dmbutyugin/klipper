@@ -350,9 +350,9 @@ class GenericCartesianKinematics:
                         idex_modes.PRIMARY, zero_pos)
         else:
             self._check_kinematics(config.error)
-        self.track_junction_carriages = []
         self._default_junction_carriages = [
-                [c for c in self.carriages.values() if c.is_active()],
+                [c for c in self.carriages.values() if c.is_active()]]
+        self.track_junction_carriages = [
                 # Dual carriages + remaining complements
                 self.dc_carriages + [
                     c for c in self.carriages.values()
