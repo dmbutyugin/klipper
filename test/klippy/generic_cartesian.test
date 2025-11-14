@@ -45,6 +45,10 @@ G91
 G1 X20 E.2
 G90
 
+# Test direct carriage control
+SET_DUAL_CARRIAGE CARRIAGE=carriage_u MODE=DIRECT GCODE_AXIS=U
+G1 X5 U200 Y50 F6000
+
 # Test changing the stepper kinematics
 SET_STEPPER_CARRIAGES STEPPER=dual_carriage CARRIAGES=carriage_u+carriage_y1
 SET_STEPPER_CARRIAGES STEPPER=stepper_x CARRIAGES=carriage_x-carriage_y
