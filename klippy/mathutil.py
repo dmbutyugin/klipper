@@ -141,6 +141,11 @@ def matrix_mul(m1, s):
 # Matrix helper functions for NxM matrices
 ######################################################################
 
+def vec_dot(a, b):
+    if len(a) != len(b):
+        return None
+    return sum(ai * bi for ai, bi in zip(a, b))
+
 # Transpose a matrix
 def mat_transp(a):
     return [[a_j[i] for a_j in a]

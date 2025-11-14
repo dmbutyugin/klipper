@@ -127,13 +127,12 @@ class GCodeMove:
         toolhead = self.printer.lookup_object('toolhead')
         axis_map = {'X':0, 'Y': 1, 'Z': 2, 'E': 3}
         extra_axes = toolhead.get_extra_axes()
-        invalid_gcode_axes = self.get_invalid_gcode_axes()
         for index, ea in enumerate(extra_axes):
             if ea is None:
                 continue
             gcode_id = ea.get_axis_gcode_id()
             if (gcode_id is None or len(gcode_id) != 1 or not gcode_id.isupper()
-                or gcode_id in axis_map or gcode_id in invalid_gcode_axes):
+                or gcode_id in axis_map or gcode_id in "FN"):
                 continue
             axis_map[gcode_id] = index
         base_position = [0.] * len(extra_axes)
@@ -155,8 +154,6 @@ class GCodeMove:
         for a, i in self.axis_map.items():
             gcode_axes[i] = a
         return gcode_axes
-    def get_invalid_gcode_axes(self):
-        return "FN"
     # G-Code movement commands
     def cmd_G1(self, gcmd):
         # Move
