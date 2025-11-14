@@ -24,6 +24,7 @@ G1 X50 F6000
 
 # Go back to alternate carriage
 SET_DUAL_CARRIAGE CARRIAGE=1
+SET_DUAL_CARRIAGE CARRIAGE=0 MODE=MIRROR
 G1 X170 F6000
 
 # Restore dual carriage state

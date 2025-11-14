@@ -39,7 +39,7 @@ class DualCarriages:
                 if c is not None else None
                 for i, c in enumerate(dual_rails)]
         self.dc_rails = collections.OrderedDict(
-                [(c.rail.get_name(short=True), c)
+                [(c.get_name(short=True), c)
                  for c in self.primary_rails + self.dual_rails
                  if c is not None])
         self.saved_states = {}
@@ -105,13 +105,13 @@ class DualCarriages:
     def toggle_active_dc_rail(self, target_dc):
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.flush_step_generation()
-        pos = toolhead.get_position()
         kin = toolhead.get_kinematics()
         axis = target_dc.axis
         for dc in self.dc_rails.values():
             if dc != target_dc and dc.axis == axis and dc.is_active():
-                dc.inactivate(pos)
+                dc.inactivate(toolhead.get_position())
         if target_dc.mode != PRIMARY:
+            pos = toolhead.get_position()
             newpos = pos[:axis] + [target_dc.get_axis_position(pos)] \
                         + pos[axis+1:]
             target_dc.activate(PRIMARY, newpos, old_position=pos)
@@ -229,24 +229,34 @@ class DualCarriages:
         if first_rail.position_endstop > second_rail.position_endstop:
             return 1
         return -1
-    def activate_dc_mode(self, dc, mode):
+    def activate_dc_mode(self, dc, mode, gcode_axis=None):
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.flush_step_generation()
         kin = toolhead.get_kinematics()
         axis = dc.axis
-        if mode == INACTIVE:
-            dc.inactivate(toolhead.get_position())
-        elif mode == PRIMARY:
-            if dc.mode == DIRECT:
-                # Must inactivate the carriage in DIRECT mode first
-                dc.inactivate(toolhead.get_position())
+        pos = toolhead.get_position()
+        if mode == INACTIVE or dc.mode == DIRECT:
+            dc.inactivate(pos)
+        if mode == PRIMARY:
             self.toggle_active_dc_rail(dc)
-        else:
-            dc.activate(mode, toolhead.get_position())
+        elif mode != INACTIVE:
+            dc_pos = dc.get_axis_position(pos)
+            dc.activate(mode, pos)
+            if mode == DIRECT:
+                dc.set_gcode_axis(gcode_axis)
+                kin.activate_dc_direct_mode(
+                        dc.get_name(short=True), gcode_axis, dc_pos)
         kin.update_limits(axis, self.get_kin_range(toolhead, axis))
     def _handle_ready(self):
         for dc_rail in self.dc_rails.values():
             dc_rail.apply_transform()
+    def _is_gcode_axis_available(self, gcode_axis):
+        toolhead = self.printer.lookup_object('toolhead')
+        for ea in toolhead.get_extra_axes():
+            if ea is not None and ea.get_axis_gcode_id() == gcode_axis \
+                    and not ea.is_kinematic_axis():
+                return False
+        return True
     cmd_SET_DUAL_CARRIAGE_help = "Configure the dual carriages mode"
     def cmd_SET_DUAL_CARRIAGE(self, gcmd):
         mode = gcmd.get('MODE', PRIMARY).upper()
@@ -281,23 +291,32 @@ class DualCarriages:
                 raise gcmd.error(
                         "Axis %s must be homed prior to enabling mode=%s" %
                         (axis.upper(), mode))
+        if mode == DIRECT:
+            gcode_axis = gcmd.get('GCODE_AXIS', '')
+            if not gcode_axis:
+                raise gcmd.error("Must provide a valid GCODE_AXIS value")
+            if len(gcode_axis) != 1 or not gcode_axis.isupper() \
+                    or gcode_axis in "XYZFN":
+                raise gcmd.error("Not a valid GCODE_AXIS=%s" % gcode_axis)
+            if not self._is_gcode_axis_available(gcode_axis):
+                raise gcmd.error("GCODE_AXIS=%s is already in use" % gcode_axis)
+            self.activate_dc_mode(dc_rail, mode, gcode_axis)
+            return
         if mode == INACTIVE:
+            axis_name = 'XYZ'[dc_rail.axis]
             active_dcs = [dc for dc in self.dc_rails.values()
                           if dc.is_active() and dc.axis == dc_rail.axis]
             if active_dcs == [dc_rail]:
                 raise gcmd.error(
                         "Cannot deactivate the only active carriage for axis %s"
-                        % 'XYZ'[dc_rail.axis])
-        elif mode == DIRECT:
-            gcode_move = self.printer.lookup_object('gcode_move')
-            new_axis_name = dc_rail.rail.get_name(short=True)
-            if len(new_axis_name) != 1 or \
-                    new_axis_name in gcode_move.get_invalid_gcode_axes():
-                raise gcmd.error("Cannot activate DIRECT mode for carriage "
-                                 "%s: invalid GCode axis" % new_axis_name)
-            if new_axis_name.upper() in gcode_move.get_gcode_axes():
-                raise gcmd.error("Cannot activate DIRECT mode for carriage "
-                                 "%s: axis already in use" % new_axis_name)
+                        % axis_name)
+            direct_mode_dcs = [dc for dc in self.dc_rails.values()
+                               if dc.mode == DIRECT and dc.axis == dc_rail.axis]
+            if direct_mode_dcs and direct_mode_dcs != [dc_rail]:
+                raise gcmd.error(
+                        "Cannot deactivate a carriage when another one is in"
+                        " DIRECT mode (%s) for axis %s" % (
+                            direct_mode_dcs[0].get_name(short=True), axis_name))
         self.activate_dc_mode(dc_rail, mode)
     cmd_SAVE_DUAL_CARRIAGE_STATE_help = \
             "Save dual carriages modes and positions"
@@ -310,6 +329,8 @@ class DualCarriages:
                                    for dc in self.dc_rails.values()},
                 'carriage_positions': {dc.get_name() : dc.get_axis_position(pos)
                                        for dc in self.dc_rails.values()},
+                'carriage_gcode_axes': {dc.get_name() : dc.gcode_axis
+                                        for dc in self.dc_rails.values()},
                 'toolhead_position': tuple(pos)}
     cmd_RESTORE_DUAL_CARRIAGE_STATE_help = \
             "Restore dual carriages modes and positions"
@@ -324,8 +345,9 @@ class DualCarriages:
     def restore_dual_carriage_state(self, saved_state, move, move_speed=0.):
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.flush_step_generation()
-        move_pos = list(toolhead.get_position())
         dcs = list(self.dc_rails.values())
+        for dc in dcs:
+            dc.inactivate(toolhead.get_position())
         if move:
             homing_speed = 99999999.
             cur_pos = []
@@ -360,24 +382,32 @@ class DualCarriages:
                             cur_pos[primary_ind])
             toolhead.manual_move(move_pos, move_speed or homing_speed)
             toolhead.flush_step_generation()
-        # Inactivate all carriages in order to restore scaling coefficients
-        # (if a move was requested) and correctly compute kinematics limits
-        for dc in dcs:
-            dc.inactivate(move_pos)
-        # Restore toolhead position in case some axes have no primary carriages
-        for axis in self.axes:
-            move_pos[axis] = saved_state['toolhead_position'][axis]
-        toolhead.set_position(move_pos)
+            # Make sure the scaling coefficients are restored with the mode
+            for dc in dcs:
+                dc.inactivate(move_pos)
         saved_modes = saved_state['carriage_modes']
         saved_primary_dcs = [dc for dc in self.dc_rails.values()
                              if saved_modes[dc.get_name()] == PRIMARY]
         # First activate all primary carriages
         for dc in saved_primary_dcs:
             self.activate_dc_mode(dc, PRIMARY)
-        # Then set the modes the remaining carriages
+        # Restore toolhead position for axes with no primary carriages
+        toolhead_pos = list(toolhead.get_position())
+        for axis in self.axes:
+            if axis not in [dc.get_axis() for dc in saved_primary_dcs]:
+                toolhead_pos[axis] = saved_state['toolhead_position'][axis]
+        toolhead.set_position(toolhead_pos)
+        # Then restore the modes of the remaining carriages
+        saved_gcode_axes = saved_state['carriage_gcode_axes']
         for dc in self.dc_rails.values():
             if dc not in saved_primary_dcs:
-                self.activate_dc_mode(dc, saved_modes[dc.get_name()])
+                dc_name = dc.get_name()
+                saved_mode = saved_modes[dc_name]
+                if saved_mode == DIRECT and not self._is_gcode_axis_available(
+                        saved_gcode_axes[dc_name]):
+                    # Cannot restore the DIRECT mode of this carriage
+                    continue
+                self.activate_dc_mode(dc, saved_mode, saved_gcode_axes[dc_name])
 
 class DualCarriagesRail:
     ENC_AXES = [b'x', b'y']
@@ -391,19 +421,21 @@ class DualCarriagesRail:
         self.mode = (INACTIVE, PRIMARY)[active]
         self.offset = 0.
         self.scale = 1. if active else 0.
-    def get_name(self):
-        return self.rail.get_name()
+        self.gcode_axis = None
+    def get_name(self, short=False):
+        return self.rail.get_name(short)
     def is_active(self):
         return self.mode != INACTIVE
+    def set_gcode_axis(self, gcode_axis):
+        self.gcode_axis = gcode_axis
     def get_axis(self, mode=None):
         if (mode or self.mode) != DIRECT:
             return self.axis
-        axis_name = self.rail.get_name(short=True).upper()
         extra_axes = self.printer.lookup_object('toolhead').get_extra_axes()
         for index, ea in enumerate(extra_axes):
             if ea is None:
                 continue
-            if axis_name == ea.get_axis_gcode_id():
+            if self.gcode_axis == ea.get_axis_gcode_id():
                 return index
         return None
     def get_axis_position(self, position):
@@ -420,10 +452,6 @@ class DualCarriagesRail:
         self.scale = -1. if mode == MIRROR else 1.
         if mode == DIRECT:
             self.offset = 0.
-            toolhead = self.printer.lookup_object('toolhead')
-            kin = toolhead.get_kinematics()
-            kin.activate_dc_direct_mode(self.rail.get_name(short=True),
-                                        old_axis_position)
         else:
             self.offset = old_axis_position - position[self.axis] * self.scale
         self.apply_transform()
@@ -434,7 +462,7 @@ class DualCarriagesRail:
         if prev_mode == DIRECT:
             toolhead = self.printer.lookup_object('toolhead')
             kin = toolhead.get_kinematics()
-            kin.deactivate_dc_direct_mode(self.rail.get_name(short=True))
+            kin.deactivate_dc_direct_mode(self.get_name(short=True))
         self.apply_transform()
     def override_axis_scaling(self, new_scale, position):
         old_axis_position = self.get_axis_position(position)
