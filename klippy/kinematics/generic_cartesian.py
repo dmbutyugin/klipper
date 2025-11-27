@@ -301,6 +301,12 @@ class MoveCarriageMapper:
             start_pos[0], start_pos[1], start_pos[2],
             axes_r[0], axes_r[1], axes_r[2],
             move.start_v, move.cruise_v, move.accel)
+    def set_position(self, newpos, steppers):
+        remapped_newpos = list(newpos)
+        for i, o in self.axes_map.items():
+            remapped_newpos[o] = newpos[i]
+        for s in steppers:
+            s.set_position(remapped_newpos)
 
 class DCVirtualToolhead:
     def __init__(self, config, toolhead):
@@ -308,6 +314,7 @@ class DCVirtualToolhead:
         self.toolhead = toolhead
         self.direct_dc_carriages = []
         self.move_mappers = {}
+        self.stepper_map = {}
         self.active_mappers = []
     def get_direct_mode_carriages(self):
         return self.direct_dc_carriages
@@ -315,6 +322,7 @@ class DCVirtualToolhead:
         kin = self.toolhead.get_kinematics()
         toolhead_trapq = self.toolhead.get_trapq()
         del self.active_mappers[:]
+        self.stepper_map = collections.defaultdict(list)
         for ks in kin.kin_steppers:
             control_carriages = tuple(sorted([c.get_control_carriage()
                                               for c in ks.get_carriages()],
@@ -330,6 +338,7 @@ class DCVirtualToolhead:
             ks.get_stepper().set_trapq(move_mapper.get_trapq())
             if move_mapper not in self.active_mappers:
                 self.active_mappers.append(move_mapper)
+            self.stepper_map[control_carriages].append(ks)
         for move_mapper in self.active_mappers:
             move_mapper.update_carriage_axes()
     def activate_direct_mode(self, dual_carriage, carriage_pos):
@@ -345,6 +354,10 @@ class DCVirtualToolhead:
     def process_move(self, print_time, move):
         for move_mapper in self.active_mappers:
             move_mapper.process_move(print_time, move)
+    def set_position(self, newpos, steppers=None):
+        for carriages, default_steppers in self.stepper_map.items():
+            move_mapper = self.move_mappers[carriages]
+            move_mapper.set_position(newpos, steppers or default_steppers)
 
 class GenericCartesianKinematics:
     def __init__(self, toolhead, config):
@@ -543,8 +556,12 @@ class GenericCartesianKinematics:
     def update_limits(self, i, range):
         self.limits[i] = range
     def set_position(self, newpos, homing_axes):
+        toolhead_trapq = self.toolhead.get_trapq()
         for s in self.kin_steppers:
-            s.set_position(newpos)
+            if s.get_stepper().get_trapq() is toolhead_trapq:
+                s.set_position(newpos)
+        if self.dc_toolhead is not None:
+            self.dc_toolhead.set_position(newpos)
         for axis_name in homing_axes:
             axis = "xyz".index(axis_name)
             for c in self.carriages.values():
@@ -699,7 +716,11 @@ class GenericCartesianKinematics:
             raise gcmd.error("SET_STEPPER_CARRIAGES cannot add or remove "
                              "carriages that the stepper controls")
         pos = self.toolhead.get_position()
-        stepper.set_position(pos)
+        if self.dc_toolhead is None or \
+                stepper.get_stepper().get_trapq() is self.toolhead.get_trapq():
+            stepper.set_position(pos)
+        else:
+            self.dc_toolhead.set_position(pos, steppers=[stepper])
         if not validate:
             return
         if self.dc_module:
