@@ -186,10 +186,10 @@ class DualCarriage:
         end_pos = move.end_pos
         ds = start_pos[axis] - start_pos[ea_index]
         de = end_pos[axis] - end_pos[ea_index]
-        if min(abs(ds), abs(de)) < self.safe_dist:
+        if abs(de) < self.safe_dist:
             # Carriages get too close
             raise move.move_error()
-        if (ds < 0) != (de < 0):
+        if (math.copysign(de, ds) < 0) != (de < 0):
             # Carriages trajectories intersect
             raise move.move_error()
     def check_move(self, move, ea_index):
