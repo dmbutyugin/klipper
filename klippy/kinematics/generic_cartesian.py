@@ -293,6 +293,9 @@ class DCVirtualToolhead:
         for carriages, default_steppers in self.stepper_map.items():
             move_mapper = self.move_mappers[carriages]
             move_mapper.set_position(newpos, steppers or default_steppers)
+    def get_remapped_steppers(self):
+        return set(ks for kin_steppers in self.stepper_map.values()
+                   for ks in kin_steppers)
 
 class GenericCartesianKinematics:
     def __init__(self, toolhead, config):
@@ -493,12 +496,14 @@ class GenericCartesianKinematics:
     def update_limits(self, i, range):
         self.limits[i] = range
     def set_position(self, newpos, homing_axes):
-        toolhead_trapq = self.toolhead.get_trapq()
-        for s in self.kin_steppers:
-            if s.get_stepper().get_trapq() is toolhead_trapq:
-                s.set_position(newpos)
         if self.dc_toolhead is not None:
+            remapped_steppers = self.dc_toolhead.get_remapped_steppers()
             self.dc_toolhead.set_position(newpos)
+        else:
+            remapped_steppers = []
+        for s in self.kin_steppers:
+            if s not in remapped_steppers:
+                s.set_position(newpos)
         for axis_name in homing_axes:
             axis = "xyz".index(axis_name)
             for c in self.carriages.values():
@@ -654,7 +659,7 @@ class GenericCartesianKinematics:
                              "carriages that the stepper controls")
         pos = self.toolhead.get_position()
         if self.dc_toolhead is None or \
-                stepper.get_stepper().get_trapq() is self.toolhead.get_trapq():
+                stepper not in self.dc_toolhead.get_remapped_steppers():
             stepper.set_position(pos)
         else:
             self.dc_toolhead.set_position(pos, steppers=[stepper])
