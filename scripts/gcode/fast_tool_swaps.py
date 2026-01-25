@@ -5,7 +5,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
-import datetime, math, optparse, re
+import datetime, math, optparse, re, sys
 
 PROCESSED_MARKER = '; Processed by fast tool swaps script'
 EXTRUDER_SYNC_GCMD_TMPL = 'SYNC_EXTRUDER_MOTION EXTRUDER=%s MOTION_QUEUE=%s\n'
@@ -204,15 +204,15 @@ class GCodeProcessor:
                 self.long_preheat_time[i] = (
                         self.min_preheat_time[i] /
                         (1. - self.inactive_tool_temp_reduction[i]))
-                optparser.error(
             if self.long_preheat_time[i] >= 0 and \
                     self.long_preheat_time[i] < self.min_preheat_time[i]:
+                raise optparse.OptionValueError(
                         "Incorrect long_preheat_time=%.3f provided"
                         % self.long_preheat_time[i])
             if self.long_preheat_purge_length[i] < 0:
                 self.long_preheat_purge_length[i] = self.min_purge_length[i]
             elif self.long_preheat_purge_length[i] < self.min_purge_length[i]:
-                optparser.error(
+                raise optparse.OptionValueError(
                         "Incorrect long_preheat_purge_length=%.3f provided"
                         % self.long_preheat_purge_length[i])
         tools = []
@@ -220,15 +220,17 @@ class GCodeProcessor:
             t_def = vars(options)['t%d' % i]
             t_parts = t_def.split(':')
             if len(t_parts) != 3 or t_parts[2] not in ('+', '-'):
-                optparser.error("Incorrect t%d=%s provided" % (i, t_def))
+                raise optparse.OptionValueError(
+                        "Incorrect t%d=%s provided" % (i, t_def))
             tools.append(t_parts)
         self.carriages = tuple(tools[i][0] for i in range(num_tools))
         self.extruders = tuple(tools[i][1] for i in range(num_tools))
         self.wipe_dirs = tuple(tools[i][2] for i in range(num_tools))
         self.extra_gcode_axis = options.extra_gcode_axis.upper()
         if len(self.extra_gcode_axis) != 1 or self.extra_gcode_axis in "XYZEFN":
-            optparser.error("Incorrect extra_gcode_axis=%s provided"
-                            % options.extra_gcode_axis)
+            raise optparse.OptionValueError(
+                    "Incorrect extra_gcode_axis=%s provided"
+                    % options.extra_gcode_axis)
         self.parse_per_tool_float_param(optparser, options, 'tool_wipe_dist',
                                         min_val=0., max_val=100.)
         self.wipe_enabled = [twd > 0. for twd in self.tool_wipe_dist]
@@ -267,10 +269,12 @@ class GCodeProcessor:
                     self.tool_shutoff_time[i] = 0.
         self.tool_fast_change_gcode = options.tool_fast_change_gcode
         if not self.tool_fast_change_gcode:
-            optparser.error("--tool_fast_change_gcode must be provided")
+            raise optparse.OptionValueError(
+                    "--tool_fast_change_gcode must be provided")
         if not "{next_tool}" in self.tool_fast_change_gcode:
-            optparser.error("Malformed tool_fast_change_gcode='%s' provided"
-                            % options.tool_fast_change_gcode)
+            raise optparse.OptionValueError(
+                    "Malformed tool_fast_change_gcode='%s' provided"
+                    % options.tool_fast_change_gcode)
         self.cur_tool = -1
     def parse_per_tool_float_param(self, optparser, options, name, default=None,
                                    min_val=None, max_val=None):
@@ -280,29 +284,33 @@ class GCodeProcessor:
                 vars(self)[name] = [default] * self.num_tools
                 return
             else:
-                optparser.error("Parameter %s must be provided" % name)
+                raise optparse.OptionValueError("Parameter %s must be provided"
+                                                % name)
         elif ',' in value_str:
             try:
                 values = [float(v.strip()) for v in value_str.split(',')]
             except ValueError:
-                optparser.error("Invalid format for %s='%s'" % (name,
-                                                                value_str))
+                raise optparse.OptionValueError("Invalid format for %s='%s'"
+                                                % (name, value_str))
         else:
             try:
                 values = [float(value_str.strip())]
             except ValueError:
-                optparser.error("Invalid format for %s='%s'" % (name,
-                                                                value_str))
+                raise optparse.OptionValueError("Invalid format for %s='%s'"
+                                                % (name, value_str))
         for value in values:
             if min_val is not None and value < min_val:
-                optparser.error("Too small %s=%f provided" % (name, value))
+                raise optparse.OptionValueError("Too small %s=%f provided"
+                                                % (name, value))
             if max_val is not None and value > max_val:
-                optparser.error("Too large %s=%f provided" % (name, value))
+                raise optparse.OptionValueError("Too large %s=%f provided"
+                                                % (name, value))
         if len(values) == 1:
             values = values * self.num_tools
         elif len(values) != self.num_tools:
-            optparser.error("Invalid number of values provided in %s='%s'"
-                            % (name, value_str))
+            raise optparse.OptionValueError(
+                    "Invalid number of values provided in %s='%s'"
+                    % (name, value_str))
         vars(self)[name] = values
     def consume_next_line(self):
         while True:
@@ -517,6 +525,15 @@ class GCodeProcessor:
         self.cur_tool = next_tool
         del self.buffer[:tool_change_ind+1]
 
+def exit_with_error(optparser, options, msg):
+    sys.stderr.write(msg + '\n')
+    if options.confirm_on_error:
+        sys.stderr.write('\n')
+        sys.stderr.write(optparser.format_help())
+        sys.stderr.write('Press Enter to continue...\n')
+        input()
+    sys.exit(1)
+
 def main():
     # Parse command-line arguments
     usage = "%prog [options] <input>"
@@ -622,25 +639,32 @@ def main():
                     help="Tool wipe z-hop (mm), either a single number or"
                     + " a comma-separated list of values, one per tool."
                     + " When not set, explicit z-hops are disabled.")
+    opts.add_option("--confirm_on_error", default=False, action="store_true",
+                    help="When set, wait for the user confirmation before"
+                    + " exiting if an error was encountered.")
     options, args = opts.parse_args()
     if len(args) != 1:
-        opts.error("Incorrect number of arguments")
+        exit_with_error(opts, options, "Incorrect number of arguments")
 
-    gcode_processor = GCodeProcessor(num_tools=2,
-                                     optparser=opts, options=options)
+    try:
+        gcode_processor = GCodeProcessor(num_tools=2,
+                                         optparser=opts, options=options)
+    except Exception as e:
+        exit_with_error(opts, options, str(e))
     with open(args[0], encoding='utf-8') as fi:
         input_lines = [l for l in fi]
     if any(True for line in input_lines
            if line.startswith(PROCESSED_MARKER)):
-        opts.error('The input file was already processed by the fast tool'
-                   ' swaps script once. You must use the original file'
-                   ' for processing, or slice GCode anew.')
+        exit_with_error(opts, options,
+                        'The input file was already processed by the fast tool'
+                        ' swaps script once. You must use the original file'
+                        ' for processing, or slice GCode anew.')
     with open(options.output or args[0], mode='wt', encoding='utf-8') as fo:
         try:
             for out_line in gcode_processor.process(iter(input_lines)):
                 fo.write(out_line)
         except Exception as e:
-            opts.error(str(e))
+            exit_with_error(opts, options, str(e))
 
 if __name__ == '__main__':
     main()
