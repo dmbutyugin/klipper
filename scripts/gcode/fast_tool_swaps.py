@@ -5,7 +5,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
-import datetime, math, optparse, re, sys
+import datetime, heapq, math, optparse, re, sys
 
 PROCESSED_MARKER = '; Processed by fast tool swaps script'
 EXTRUDER_SYNC_GCMD_TMPL = 'SYNC_EXTRUDER_MOTION EXTRUDER=%s MOTION_QUEUE=%s\n'
@@ -28,7 +28,7 @@ class GCodeState:
         self.acceleration = None if other is None else other.acceleration
         self.current_tool = 0 if other is None else other.current_tool
         self.extruder_temps = ([0] * num_tools if other is None
-                               else other.extruder_temps)
+                               else list(other.extruder_temps))
         self.position = [0.] * 4 if other is None else list(other.position)
     def get_updated_from(self, gcmd):
         new = GCodeState(self.num_tools, other=self)
@@ -112,7 +112,7 @@ class GCodeCommand:
         cmd = self.cmd
         if cmd in ('G0', 'G1'):
             return 'G1'
-        if cmd in ('T0', 'T1'):
+        if cmd.startswith('T') and cmd[1:].isnumeric():
             return 'T'
         if cmd.startswith(';'):
             return 'C'
@@ -159,6 +159,24 @@ class GCodeCommand:
         if self.get_type() != 'G1':
             return 0.
         return self.move_d[3]
+
+PREHEAT = 1
+PURGE = 2
+WIPE = 3
+
+class ToolActivationData:
+    def __init__(self, tool, target_pos, min_purge_length, long_preheat,
+                 preheat_ind, purge_ind, wipe_start_ind, wipe_end_ind,
+                 tool_change_ind):
+        self.tool = tool
+        self.target_pos = target_pos
+        self.min_purge_length = min_purge_length
+        self.long_preheat = long_preheat
+        self.preheat_ind = preheat_ind
+        self.purge_ind = purge_ind
+        self.wipe_start_ind = wipe_start_ind
+        self.wipe_end_ind = wipe_end_ind
+        self.tool_change_ind = tool_change_ind
 
 class GCodeProcessor:
     def __init__(self, num_tools, optparser, options):
@@ -312,84 +330,76 @@ class GCodeProcessor:
                     "Invalid number of values provided in %s='%s'"
                     % (name, value_str))
         vars(self)[name] = values
-    def consume_next_line(self):
-        while True:
-            line = next(self.lines, None)
-            if line is None:
-                return None
-            gcmd = GCodeCommand(line, self.gcode_state)
-            self.gcode_state = gcmd.get_gcode_state()
-            # Check if a GCode command should be skipped
-            if gcmd.get_type() == 'M104' and \
-                    self.enable_temp_control[self.gcode_state.current_tool]:
-                T = gcmd.get_param('T', int, self.gcode_state.current_tool)
-                if T != self.gcode_state.current_tool:
-                    continue
-            self.buffer.append(gcmd)
-            return gcmd
     def process(self, lines):
-        self.buffer = []
-        self.cur_tool = -1
-        self.tool_heated = [False, False]
-        self.lines = lines
-        self.gcode_state = GCodeState(num_tools=self.num_tools)
+        self.preprocess_gcode(lines)
         yield PROCESSED_MARKER + datetime.datetime.now(datetime.UTC).strftime(
                 ' on %Y-%m-%d at %H:%M:%S UTC\n')
-        while True:
-            gcmd = self.consume_next_line()
-            if gcmd is None:
-                break
-            if gcmd.get_type() != 'T':
-                continue
-            for l in self.handle_tool_swap():
-                yield l
-        if self.buffer:
-            cur_tool = self.buffer[0].get_gcode_state().current_tool
-            for i, e in enumerate(
-                    self.buffer[0].get_gcode_state().extruder_temps):
-                if i != cur_tool and e and self.enable_temp_control[i]:
-                    yield M104_GCMD_TMPL % (i, 0.)
-                    self.tool_heated[i] = False
-        for gcmd in self.buffer:
+        for ind in range(len(self.buffer)):
+            gcmd = self.buffer[ind]
             yield gcmd.get_line()
-    def handle_tool_swap(self):
-        first_gcode_state = self.buffer[0].get_gcode_state()
-        tool_swap_gcode_state = self.buffer[-1].get_gcode_state()
-        next_tool = tool_swap_gcode_state.current_tool
-        if self.cur_tool in (-1, next_tool):
-            for gcmd in self.buffer[:-1]:
-                yield gcmd.get_line()
-            if self.cur_tool == -1:
-                yield self.buffer[-1].get_line()
-            del self.buffer[:]
-            self.cur_tool = next_tool
-            self.tool_heated[self.cur_tool] = True
+            if gcmd.get_type() == 'T':
+                break
+        self.cur_tool = self.buffer[ind].get_gcode_state().current_tool
+        self.tool_heated[self.cur_tool] = True
+        for tool in range(self.num_tools):
+            if tool != self.cur_tool:
+                self.find_next_activation(tool, ind+1)
+        for l in self.process_gcode(ind+1):
+            yield l
+    def preprocess_gcode(self, lines):
+        self.buffer = []
+        self.cur_tool = -1
+        self.tool_heated = [False] * self.num_tools
+        self.tool_activation_data = [None] * self.num_tools
+        self.purging_extruders = []
+        self.events = []
+        gcode_state = GCodeState(num_tools=self.num_tools)
+        for line in lines:
+            gcmd = GCodeCommand(line, gcode_state)
+            gcode_state = gcmd.get_gcode_state()
+            # Check if a GCode command should be skipped
+            if gcmd.get_type() == 'M104' and \
+                    self.enable_temp_control[gcode_state.current_tool]:
+                T = gcmd.get_param('T', int, gcode_state.current_tool)
+                if T != gcode_state.current_tool:
+                    continue
+            self.buffer.append(gcmd)
+    def find_next_activation(self, tool, start_index):
+        self.tool_activation_data[tool] = None
+        tool_change_ind = None
+        for ind in range(start_index, len(self.buffer)):
+            gcmd = self.buffer[ind]
+            if gcmd.get_type() == 'T' and \
+                    gcmd.get_gcode_state().current_tool == tool and \
+                    self.buffer[ind-1].get_gcode_state().current_tool != tool:
+                tool_change_ind = ind
+                break
+        if tool_change_ind is None:
             return
-        min_purge_length = self.min_purge_length[next_tool]
-        min_preheat_time = self.min_preheat_time[next_tool]
-        tool_swap_print_time = (tool_swap_gcode_state.print_time
-                                - first_gcode_state.print_time)
-        inactive_tool_temp_reduction = \
-                self.inactive_tool_temp_reduction[next_tool]
-        long_preheat = self.enable_temp_control[next_tool] and (
-                not self.tool_heated[next_tool]
-                or (self.tool_shutoff_time[next_tool] and
+        tool_swap_gcode_state = self.buffer[tool_change_ind].get_gcode_state()
+        min_purge_length = self.min_purge_length[tool]
+        min_preheat_time = self.min_preheat_time[tool]
+        tool_swap_print_time = \
+                (tool_swap_gcode_state.print_time
+                 - self.buffer[start_index].get_gcode_state().print_time)
+        long_preheat = self.enable_temp_control[tool] and (
+                not self.tool_heated[tool]
+                or (self.tool_shutoff_time[tool] and
                     tool_swap_print_time > max(
-                        self.long_preheat_time[next_tool],
-                        self.tool_shutoff_time[next_tool])))
+                        self.long_preheat_time[tool],
+                        self.tool_shutoff_time[tool])))
         if long_preheat:
-            min_preheat_time = self.long_preheat_time[next_tool]
-            min_purge_length = self.long_preheat_purge_length[next_tool]
-            if self.tool_heated[next_tool]:
-                yield M104_GCMD_TMPL % (next_tool, 0.)
-        min_purge_length = max(min_purge_length, 0)
+            min_preheat_time = self.long_preheat_time[tool]
+            min_purge_length = self.long_preheat_purge_length[tool]
+        min_purge_length = max(min_purge_length, 0.)
         wipe_start_ind = wipe_end_ind = preheat_ind = purge_ind = None
         extrude_length = print_time = 0.
-        tool_change_ind = len(self.buffer) - 1
-        if not self.wipe_enabled[next_tool]:
+        if not self.wipe_enabled[tool]:
             wipe_start_ind = wipe_end_ind = tool_change_ind - 1
-        for i in range(tool_change_ind, -1, -1):
+        for i in range(tool_change_ind-1, start_index-1, -1):
             gcmd = self.buffer[i]
+            if gcmd.get_type() == 'T' and wipe_start_ind is None:
+                break
             if wipe_start_ind is not None:
                 extrude_length += gcmd.get_extrusion_length()
             if wipe_end_ind is None and gcmd.get_cmd().startswith(';WIPE_END'):
@@ -414,123 +424,167 @@ class GCodeProcessor:
         if wipe_start_ind is None:
             raise RuntimeError(
                     "No annotated WIPE found before the tool change")
-        preheat_ind = preheat_ind or 0
-        purge_ind = purge_ind or 0
-        need_z = False
-        while True:
-            gcmd = self.consume_next_line()
-            if gcmd is None:
-                break
-            if gcmd.get_type() == 'G1' and any(a in gcmd.params for a in "XY"):
-                if 'Z' in gcmd.params:
-                    need_z = True
-                break
-        next_temp = self.buffer[-1].get_gcode_state().extruder_temps[next_tool]
-        target_pos = self.buffer[-1].get_gcode_state().position[:3]
-        for i in range(preheat_ind):
-            yield self.buffer[i].get_line()
-        if self.enable_temp_control[next_tool]:
-            if not next_temp:
-                raise RuntimeError(
-                        "Must print with T%d, but its temperature is not set"
-                        % next_tool)
-            yield M104_GCMD_TMPL % (next_tool, next_temp)
-        self.tool_heated[next_tool] = True
-        for i in range(preheat_ind, purge_ind):
-            yield self.buffer[i].get_line()
-        actual_purge_length = 0.
-        if min_purge_length:
-            yield EXTRUDER_SYNC_GCMD_TMPL % (self.extruders[next_tool],
-                                             self.extruders[self.cur_tool])
-        for i in range(purge_ind, wipe_start_ind+1):
-            actual_purge_length += self.buffer[i].get_extrusion_length()
-            yield self.buffer[i].get_line()
-        if inactive_tool_temp_reduction < 1.:
-            yield M104_GCMD_TMPL % (
-                    self.cur_tool,
-                    tool_swap_gcode_state.extruder_temps[self.cur_tool]
-                    * inactive_tool_temp_reduction)
-            self.tool_heated[self.cur_tool] = True
-        yield CARRIAGES_WIPE_PREPARE_SNIPPET.format(**{
-            'next_carriage': self.carriages[next_tool],
-            'prev_carriage': self.carriages[self.cur_tool],
-            'gcode_id': self.extra_gcode_axis,
-            'tool_wipe_feedrate': 60. * (self.tool_wipe_speed[next_tool] or
-                                         self.tool_swap_speed[next_tool]),
-            'tool_wipe_accel': (self.tool_wipe_accel[next_tool] or
-                                self.tool_swap_accel[next_tool])
-            })
         if any(gcmd.get_extrusion_length() > 1e-7
                for gcmd in self.buffer[wipe_start_ind+1:tool_change_ind]):
             raise RuntimeError("More extrusion after the last tool wipe"
                                + " before the tool change")
-        half_retract = -0.5 * sum(
-                gcmd.get_extrusion_length()
-                for gcmd in self.buffer[wipe_start_ind+1:tool_change_ind])
-        executed_retract = 0.
-        wipe_dir = 1.0 if self.wipe_dirs[next_tool] == '+' else -1.0
-        wipe_dist = self.tool_wipe_dist[next_tool]
-        for i in range(wipe_start_ind+1, tool_change_ind):
-            gcmd = self.buffer[i]
-            if gcmd.get_type() != 'G1':
-                yield self.buffer[i].get_line()
+        preheat_ind = preheat_ind or start_index
+        purge_ind = purge_ind or start_index
+        need_z = False
+        target_pos = self.buffer[tool_change_ind].get_gcode_state().position
+        for ind in range(tool_change_ind, len(self.buffer)):
+            gcmd = self.buffer[ind]
+            if gcmd.get_type() == 'G1' and any(a in gcmd.params for a in "XY"):
+                if 'Z' in gcmd.params:
+                    need_z = True
+                target_pos = gcmd.get_gcode_state().position
+                break
+        target_pos = target_pos[:(3 if need_z else 2)]
+        heapq.heappush(self.events, (preheat_ind, PREHEAT, tool))
+        heapq.heappush(self.events, (purge_ind, PURGE, tool))
+        heapq.heappush(self.events, (wipe_start_ind+1, WIPE, tool))
+        self.tool_activation_data[tool] = ToolActivationData(
+                tool=tool, target_pos=target_pos,
+                min_purge_length=min_purge_length, long_preheat=long_preheat,
+                preheat_ind=preheat_ind, purge_ind=purge_ind,
+                wipe_start_ind=wipe_start_ind, wipe_end_ind=wipe_end_ind,
+                tool_change_ind=tool_change_ind)
+    def get_next_tool_event(self):
+        if not self.events:
+            return None, None, len(self.buffer)
+        next_event_ind, next_event, next_tool = heapq.heappop(self.events)
+        return next_tool, next_event, next_event_ind
+    def process_gcode(self, start_index):
+        ind = start_index
+        while ind < len(self.buffer):
+            next_tool, next_event, next_event_ind = self.get_next_tool_event()
+            while ind < next_event_ind:
+                yield self.buffer[ind].get_line()
+                ind += 1
+            if ind >= len(self.buffer):
+                break
+            tool_change_ind = \
+                    self.tool_activation_data[next_tool].tool_change_ind
+            tool_change_gcode_state = \
+                    self.buffer[tool_change_ind].get_gcode_state()
+            if next_event == PREHEAT:
+                if self.enable_temp_control[next_tool]:
+                    next_temp = \
+                            tool_change_gcode_state.extruder_temps[next_tool]
+                    if not next_temp:
+                        raise RuntimeError(
+                                "Must print with T%d, but its"
+                                " temperature is not set" % next_tool)
+                    yield M104_GCMD_TMPL % (next_tool, next_temp)
+                    self.tool_heated[next_tool] = True
                 continue
-            if not any(gcmd.move_d):
+            if next_event == PURGE:
+                if self.tool_activation_data[next_tool].min_purge_length:
+                    yield EXTRUDER_SYNC_GCMD_TMPL % (
+                            self.extruders[next_tool],
+                            self.extruders[self.cur_tool])
+                    self.purging_extruders.append(next_tool)
                 continue
-            cur_retract = -gcmd.get_extrusion_length()
-            while cur_retract > 0.:
-                if executed_retract + cur_retract > half_retract:
-                    retract = half_retract - executed_retract
-                    move_d = [d * retract / -gcmd.move_d[3]
-                              for d in gcmd.move_d]
-                    executed_retract = 0.
-                    cur_retract -= retract
-                    if cur_retract < 0.000001:
+            # next_event == WIPE
+            wipe_start_ind = next_event_ind
+            inactive_tool_temp_reduction = \
+                    self.inactive_tool_temp_reduction[self.cur_tool]
+            tool_swap_gcode_state = \
+                    self.buffer[tool_change_ind].get_gcode_state()
+            if inactive_tool_temp_reduction < 1.:
+                yield M104_GCMD_TMPL % (
+                        self.cur_tool,
+                        tool_swap_gcode_state.extruder_temps[self.cur_tool]
+                        * inactive_tool_temp_reduction)
+                self.tool_heated[self.cur_tool] = True
+            yield CARRIAGES_WIPE_PREPARE_SNIPPET.format(**{
+                'next_carriage': self.carriages[next_tool],
+                'prev_carriage': self.carriages[self.cur_tool],
+                'gcode_id': self.extra_gcode_axis,
+                'tool_wipe_feedrate': 60. * (
+                    self.tool_wipe_speed[next_tool] or
+                    self.tool_swap_speed[next_tool]),
+                'tool_wipe_accel': (self.tool_wipe_accel[next_tool] or
+                                    self.tool_swap_accel[next_tool])
+                })
+            half_retract = -0.5 * sum(
+                    gcmd.get_extrusion_length()
+                    for gcmd in self.buffer[wipe_start_ind+1:tool_change_ind])
+            executed_retract = 0.
+            wipe_dir = 1.0 if self.wipe_dirs[next_tool] == '+' else -1.0
+            wipe_dist = self.tool_wipe_dist[next_tool]
+            for ind in range(wipe_start_ind+1, tool_change_ind):
+                gcmd = self.buffer[ind]
+                if gcmd.get_type() != 'G1':
+                    yield self.buffer[ind].get_line()
+                    continue
+                if not any(gcmd.move_d):
+                    continue
+                cur_retract = -gcmd.get_extrusion_length()
+                while cur_retract > 0.:
+                    if executed_retract + cur_retract > half_retract:
+                        retract = half_retract - executed_retract
+                        move_d = [d * retract / -gcmd.move_d[3]
+                                  for d in gcmd.move_d]
+                        executed_retract = 0.
+                        cur_retract -= retract
+                        if cur_retract < 0.000001:
+                            cur_retract = 0.
+                        next_wipe_dir = -wipe_dir
+                    else:
+                        move_d = [d * cur_retract / -gcmd.move_d[3]
+                                  for d in gcmd.move_d]
+                        executed_retract += cur_retract
                         cur_retract = 0.
-                    next_wipe_dir = -wipe_dir
-                else:
-                    move_d = [d * cur_retract / -gcmd.move_d[3]
-                              for d in gcmd.move_d]
-                    executed_retract += cur_retract
-                    cur_retract = 0.
-                    next_wipe_dir = wipe_dir
-                coord_str = ' '.join('%s%.6f' % (a, d)
-                                     for a, d in zip("XYZE", move_d) if d)
-                extra_axis_d = -wipe_dir * wipe_dist * move_d[3] / half_retract
-                coord_str += ' %s%.6f' % (self.extra_gcode_axis, extra_axis_d)
-                tool_wipe_z_hop = self.tool_wipe_z_hop[next_tool]
-                if not gcmd.move_d[2] and tool_wipe_z_hop:
-                    z_hop_d = -0.5 * tool_wipe_z_hop * move_d[3] / half_retract
-                    coord_str += ' Z%.6f' % z_hop_d
-                yield 'G1 %s\n' % coord_str
-                wipe_dir = next_wipe_dir
-        if min_purge_length:
-            yield EXTRUDER_SYNC_GCMD_TMPL % (self.extruders[next_tool],
-                                             self.extruders[next_tool])
-        yield 'G90\n'
-        if self.wipe_enabled[next_tool]:
-            yield 'M204 S%.0f\n' % self.tool_swap_accel[next_tool]
-            yield 'G1 F%.0f\n' % (60. * self.tool_swap_speed[next_tool])
-        yield self.tool_fast_change_gcode.format(**{
-            'next_tool': next_tool,
-            'xpos': '%.6f' % target_pos[0],
-            'ypos': '%.6f' % target_pos[1],
-            }) + '\n'
-        if need_z:
-            yield 'G1 Z%.6f\n' % target_pos[2]
-        yield 'G1 F%.0f\n' % tool_swap_gcode_state.feed_rate
-        yield 'M204 S%.f\n' % tool_swap_gcode_state.acceleration
-        if tool_swap_gcode_state.absolute_extrude:
-            yield 'M82\n'
-        self.cur_tool = next_tool
-        del self.buffer[:tool_change_ind+1]
+                        next_wipe_dir = wipe_dir
+                    coord_str = ' '.join('%s%.6f' % (a, d)
+                                         for a, d in zip("XYZE", move_d) if d)
+                    r_ratio = move_d[3] / half_retract
+                    extra_axis_d = -wipe_dir * wipe_dist * r_ratio
+                    coord_str += ' %s%.6f' % (self.extra_gcode_axis,
+                                              extra_axis_d)
+                    tool_wipe_z_hop = self.tool_wipe_z_hop[next_tool]
+                    if not gcmd.move_d[2] and tool_wipe_z_hop:
+                        z_hop_d = -0.5 * tool_wipe_z_hop * r_ratio
+                        coord_str += ' Z%.6f' % z_hop_d
+                    yield 'G1 %s\n' % coord_str
+                    wipe_dir = next_wipe_dir
+            for extruder in self.purging_extruders:
+                yield EXTRUDER_SYNC_GCMD_TMPL % (self.extruders[extruder],
+                                                 self.extruders[next_tool])
+            if next_tool in self.purging_extruders:
+                self.purging_extruders.remove(next_tool)
+
+            yield 'G90\n'
+            if self.wipe_enabled[next_tool]:
+                yield 'M204 S%.0f\n' % self.tool_swap_accel[next_tool]
+                yield 'G1 F%.0f\n' % (60. * self.tool_swap_speed[next_tool])
+            target_pos = self.tool_activation_data[next_tool].target_pos
+            yield self.tool_fast_change_gcode.format(**{
+                'next_tool': next_tool,
+                'xpos': '%.6f' % target_pos[0],
+                'ypos': '%.6f' % target_pos[1],
+                }) + '\n'
+            if len(target_pos) > 2:
+                yield 'G1 Z%.6f\n' % target_pos[2]
+            yield 'G1 F%.0f\n' % tool_swap_gcode_state.feed_rate
+            yield 'M204 S%.f\n' % tool_swap_gcode_state.acceleration
+            if tool_swap_gcode_state.absolute_extrude:
+                yield 'M82\n'
+            self.find_next_activation(self.cur_tool, tool_change_ind+1)
+            if self.enable_temp_control[self.cur_tool] and (
+                    self.tool_activation_data[self.cur_tool] is None or
+                    self.tool_activation_data[self.cur_tool].long_preheat):
+                yield M104_GCMD_TMPL % (self.cur_tool, 0.)
+            self.cur_tool = next_tool
+            ind = tool_change_ind + 1
 
 def exit_with_error(optparser, options, msg):
     sys.stderr.write(msg + '\n')
+    sys.stderr.write('\nFor more information on the parameters,'
+                     + ' run with --help argument\n')
     if options.confirm_on_error:
-        sys.stderr.write('\n')
-        sys.stderr.write(optparser.format_help())
-        sys.stderr.write('Press Enter to continue...\n')
+        sys.stderr.write('\nPress Enter to continue...\n')
         input()
     sys.exit(1)
 
@@ -541,6 +595,8 @@ def main():
     opts.add_option("-o", "--output", type="string", dest="output",
                     default=None, help="Filename of the output. If not set,"
                     + " the script edits the input file in-place.")
+    opts.add_option("-n", "--num_tools", type="int", dest="num_tools",
+                    default=2, help="Number of tools.")
     opts.add_option("--inactive_tool_temp_reduction", type="string",
                     default=None, help="If set, defines a ratio [0, 1] by how"
                     + " much to reduce the temperature during tool inactivity, "
@@ -594,6 +650,12 @@ def main():
                     + " corresponding extruder, and a sign indicating the"
                     + " direction of the wipe move along the carriage axis."
                     + " This option must be provided.")
+    for i in range(2, 10):
+        opts.add_option("--t%d" % i, type="string", dest=("t%d" % i),
+                        default=None, help=(
+                            "T%d definition in the same format as --t0 and"
+                            + " --t1. Must be set if NUM_TOOLS exceeds this"
+                            + " tool number.") % i)
     opts.add_option("--extra_gcode_axis", type="string", default="U",
                     help="Extra GCode axis to use for tool swaps."
                     + " If not set, defaults to 'U' GCode axis.")
@@ -647,7 +709,7 @@ def main():
         exit_with_error(opts, options, "Incorrect number of arguments")
 
     try:
-        gcode_processor = GCodeProcessor(num_tools=2,
+        gcode_processor = GCodeProcessor(num_tools=options.num_tools,
                                          optparser=opts, options=options)
     except Exception as e:
         exit_with_error(opts, options, str(e))
