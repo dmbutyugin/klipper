@@ -26,6 +26,7 @@ class GCodeState:
         self.print_time = 0. if other is None else other.print_time
         self.feed_rate = None if other is None else other.feed_rate
         self.acceleration = None if other is None else other.acceleration
+        self.z_feed_rate = None if other is None else other.z_feed_rate
         self.current_tool = 0 if other is None else other.current_tool
         self.extruder_temps = ([0] * num_tools if other is None
                                else list(other.extruder_temps))
@@ -50,6 +51,9 @@ class GCodeState:
                                                      self.position[3])
                 else:
                     new.position[3] += gcmd.get_param('E', float, 0.)
+                if 'Z' in gcmd.params and \
+                        not any(a in gcmd.params for a in "XYE"):
+                    new.z_feed_rate = new.feed_rate
             case 'M104':
                 tool = gcmd.get_param('T', int, self.current_tool)
                 temp = gcmd.get_param('S', float, 0.)
@@ -430,15 +434,19 @@ class GCodeProcessor:
                                + " before the tool change")
         preheat_ind = preheat_ind or start_index
         purge_ind = purge_ind or start_index
-        need_z = False
-        target_pos = self.buffer[tool_change_ind].get_gcode_state().position
+        need_z = self.tool_wipe_z_hop[tool]
+        target_pos = None
         for ind in range(tool_change_ind, len(self.buffer)):
             gcmd = self.buffer[ind]
-            if gcmd.get_type() == 'G1' and any(a in gcmd.params for a in "XY"):
+            if gcmd.get_type() == 'G1':
+                if 'E' in gcmd.params and gcmd.move_d[3] > 0.:
+                    break
                 if 'Z' in gcmd.params:
-                    need_z = True
-                target_pos = gcmd.get_gcode_state().position
-                break
+                    need_z = False
+                if any(a in gcmd.params for a in "XY") and target_pos is None:
+                    target_pos = gcmd.get_gcode_state().position
+        if target_pos is None:
+            target_pos = self.buffer[ind-1].get_gcode_state().position
         target_pos = target_pos[:(3 if need_z else 2)]
         heapq.heappush(self.events, (preheat_ind, PREHEAT, tool))
         heapq.heappush(self.events, (purge_ind, PURGE, tool))
@@ -566,7 +574,12 @@ class GCodeProcessor:
                 'ypos': '%.6f' % target_pos[1],
                 }) + '\n'
             if len(target_pos) > 2:
-                yield 'G1 Z%.6f\n' % target_pos[2]
+                z_feed_rate = (' F%.0f' % tool_swap_gcode_state.z_feed_rate
+                               if tool_swap_gcode_state.z_feed_rate else '')
+                yield 'G1 Z%.6f%s\n' % (target_pos[2], z_feed_rate)
+            if tool_swap_gcode_state.feed_rate is None:
+                raise RuntimeError(
+                        "Feed rate (speed) is not set before the tool swap")
             yield 'G1 F%.0f\n' % tool_swap_gcode_state.feed_rate
             yield 'M204 S%.f\n' % tool_swap_gcode_state.acceleration
             if tool_swap_gcode_state.absolute_extrude:
