@@ -29,6 +29,7 @@ class ADS1220:
         self.printer = printer = config.get_printer()
         self.name = config.get_name().split()[-1]
         self.last_error_count = 0
+        self.last_overflows = 0
         self.consecutive_fails = 0
         # Chip options
         # Gain
@@ -144,6 +145,7 @@ class ADS1220:
     # Start, stop, and process message batches
     def _start_measurements(self):
         self.last_error_count = 0
+        self.last_overflows = 0
         self.consecutive_fails = 0
         # Start bulk reading
         self.reset_chip()
@@ -164,10 +166,13 @@ class ADS1220:
         logging.info("ADS1220 finished '%s' measurements", self.name)
 
     def _process_batch(self, eventtime):
+        prev_errors, prev_overflows = self.last_error_count, self.last_overflows
         samples = self.ffreader.pull_samples()
+        self.last_overflows = self.ffreader.get_last_overflows()
         self._convert_samples(samples)
-        return {'data': samples, 'errors': self.last_error_count,
-                'overflows': self.ffreader.get_last_overflows()}
+        return {'data': samples,
+                'errors': self.last_error_count - prev_errors,
+                'overflows': self.last_overflows - prev_overflows}
 
     def reset_chip(self):
         # the reset command takes 50us to complete

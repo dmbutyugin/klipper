@@ -91,6 +91,7 @@ class ADS131M0X:
         self.printer = printer = config.get_printer()
         self.name = config.get_name().split()[-1]
         self.last_error_count = 0
+        self.last_overflows = 0
         self.consecutive_fails = 0
         self.sensor_type = sensor_type
         self.sensor_id = 0x20 | num_channels
@@ -232,6 +233,7 @@ class ADS131M0X:
     # Start, stop, and process message batches
     def _start_measurements(self):
         self.last_error_count = 0
+        self.last_overflows = 0
         self.consecutive_fails = 0
         # Be sure to halt bulk reading before resetting
         self.query_ads131m0x_cmd.send_wait_ack([self.oid, 0])
@@ -256,10 +258,13 @@ class ADS131M0X:
                      self.sensor_type, self.name)
 
     def _process_batch(self, eventtime):
+        prev_errors, prev_overflows = self.last_error_count, self.last_overflows
         samples = self.ffreader.pull_samples()
+        self.last_overflows = self.ffreader.get_last_overflows()
         self._convert_samples(samples)
-        return {'data': samples, 'errors': self.last_error_count,
-                'overflows': self.ffreader.get_last_overflows()}
+        return {'data': samples,
+                'errors': self.last_error_count - prev_errors,
+                'overflows': self.last_overflows - prev_overflows}
 
     def _convert_to_spi_frame(self, vals_16):
         result = []

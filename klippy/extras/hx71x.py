@@ -144,8 +144,7 @@ class HX71xBase:
                 self._start_measurements()
         else:
             self.consecutive_fails = 0
-        return {'data': samples, 'errors': self.last_error_count,
-                'overflows': self.ffreader.get_last_overflows()}
+        return {'data': samples, 'errors': errors, 'overflows': overflows}
 
 
 def HX711(config):
