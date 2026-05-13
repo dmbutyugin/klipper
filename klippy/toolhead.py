@@ -64,7 +64,7 @@ class Move:
         m = "%s: %.3f %.3f %.3f [%.3f]" % (msg, ep[0], ep[1], ep[2], ep[3])
         return self.toolhead.printer.command_error(m)
     def calc_junction(self, prev_move):
-        if not self.is_kinematic_move or not prev_move.is_kinematic_move:
+        if self.is_kinematic_move != prev_move.is_kinematic_move:
             return
         # Allow extra axes to calculate maximum junction
         ea_v2 = [ea.calc_junction(prev_move, self, e_index+3)
@@ -73,26 +73,28 @@ class Move:
                             prev_move.max_cruise_v2, prev_move.next_junction_v2,
                             prev_move.max_start_v2 + prev_move.delta_v2]
                            + ea_v2)
-        # Find max velocity using "approximated centripetal velocity"
-        axes_r = self.axes_r
-        prev_axes_r = prev_move.axes_r
-        junction_cos_theta = -(axes_r[0] * prev_axes_r[0]
-                               + axes_r[1] * prev_axes_r[1]
-                               + axes_r[2] * prev_axes_r[2])
-        sin_theta_d2 = math.sqrt(max(0.5*(1.0-junction_cos_theta), 0.))
-        cos_theta_d2 = math.sqrt(max(0.5*(1.0+junction_cos_theta), 0.))
-        one_minus_sin_theta_d2 = 1. - sin_theta_d2
-        if one_minus_sin_theta_d2 > 0. and cos_theta_d2 > 0.:
-            R_jd = sin_theta_d2 / one_minus_sin_theta_d2
-            move_jd_v2 = R_jd * self.junction_deviation * self.accel
-            pmove_jd_v2 = R_jd * prev_move.junction_deviation * prev_move.accel
-            # Approximated circle must contact moves no further than mid-move
-            #   centripetal_v2 = .5 * self.move_d * self.accel * tan_theta_d2
-            quarter_tan_theta_d2 = .25 * sin_theta_d2 / cos_theta_d2
-            move_centripetal_v2 = self.delta_v2 * quarter_tan_theta_d2
-            pmove_centripetal_v2 = prev_move.delta_v2 * quarter_tan_theta_d2
-            max_start_v2 = min(max_start_v2, move_jd_v2, pmove_jd_v2,
-                               move_centripetal_v2, pmove_centripetal_v2)
+        if self.is_kinematic_move:
+            # Find max velocity using "approximated centripetal velocity"
+            axes_r = self.axes_r
+            prev_axes_r = prev_move.axes_r
+            junction_cos_theta = -(axes_r[0] * prev_axes_r[0]
+                                   + axes_r[1] * prev_axes_r[1]
+                                   + axes_r[2] * prev_axes_r[2])
+            sin_theta_d2 = math.sqrt(max(0.5*(1.0-junction_cos_theta), 0.))
+            cos_theta_d2 = math.sqrt(max(0.5*(1.0+junction_cos_theta), 0.))
+            one_minus_sin_theta_d2 = 1. - sin_theta_d2
+            if one_minus_sin_theta_d2 > 0. and cos_theta_d2 > 0.:
+                R_jd = sin_theta_d2 / one_minus_sin_theta_d2
+                move_jd_v2 = R_jd * self.junction_deviation * self.accel
+                pmove_jd_v2 = (R_jd * prev_move.junction_deviation
+                               * prev_move.accel)
+                # Approximated circle must touch moves no further than mid-move
+                #  centripetal_v2 = .5 * self.move_d * self.accel * tan_theta_d2
+                quarter_tan_theta_d2 = .25 * sin_theta_d2 / cos_theta_d2
+                move_centripetal_v2 = self.delta_v2 * quarter_tan_theta_d2
+                pmove_centripetal_v2 = prev_move.delta_v2 * quarter_tan_theta_d2
+                max_start_v2 = min(max_start_v2, move_jd_v2, pmove_jd_v2,
+                                   move_centripetal_v2, pmove_centripetal_v2)
         # Apply limits
         self.max_start_v2 = max_start_v2
         self.max_mcr_start_v2 = min(
