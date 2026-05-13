@@ -108,19 +108,26 @@ class Move:
                        move_centripetal_v2, pmove_centripetal_v2)
         return prev_move.next_junction_v2
     def calc_junction(self, prev_move):
-        if not self.is_kinematic_move or not prev_move.is_kinematic_move:
+        if self.is_kinematic_move != prev_move.is_kinematic_move:
             return
-        if len(self.toolhead.kin_axes_map) > 3:
-            j_v2 = self.toolhead.kin.calc_junction(prev_move, self)
-        else:
-            j_v2 = self.calc_junction_v2(prev_move)
-        # Allow extra axes to calculate maximum junction
-        ea_j_v2 = [ea.calc_junction(prev_move, self, e_index+3)
+        if not self.is_kinematic_move:
+            # Check if any of the extra_axes starts or stops moving
+            if any((abs(self.axes_r[e_index+3]) < .000000001) != \
+                    (abs(prev_move.axes_r[e_index+3]) < .000000001)
                    for e_index, ea in enumerate(self.toolhead.extra_axes)
-                   if not ea.is_kinematic_axis()]
-        max_start_v2 = min([j_v2, self.max_cruise_v2, prev_move.max_cruise_v2,
-                            prev_move.max_start_v2 + prev_move.delta_v2]
-                           + ea_j_v2)
+                   if not ea.is_kinematic_axis()):
+                return
+        # Allow extra axes to calculate maximum junction
+        j_v2 = [ea.calc_junction(prev_move, self, e_index+3)
+                for e_index, ea in enumerate(self.toolhead.extra_axes)
+                if not ea.is_kinematic_axis()]
+        if self.is_kinematic_move:
+            if len(self.toolhead.kin_axes_map) > 3:
+                j_v2.append(self.toolhead.kin.calc_junction(prev_move, self))
+            else:
+                j_v2.append(self.calc_junction_v2(prev_move))
+        max_start_v2 = min([self.max_cruise_v2, prev_move.max_cruise_v2,
+                            prev_move.max_start_v2 + prev_move.delta_v2] + j_v2)
         # Apply limits
         self.max_start_v2 = max_start_v2
         self.max_mcr_start_v2 = min(
