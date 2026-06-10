@@ -111,6 +111,7 @@ def calc_weighted(positions, smooth_time):
 
 SMOOTH_TIME = .040
 PRESSURE_ADVANCE = .045
+SYSTEM_PRESSURE_ADVANCE = .045
 
 # Calculate raw pressure advance positions
 def calc_pa_raw(positions):
@@ -124,6 +125,14 @@ def calc_pa_raw(positions):
 def calc_pa(positions):
     return calc_weighted(calc_pa_raw(positions), SMOOTH_TIME)
 
+# Nozzle flow assuming nozzle follows simple pressure advance model
+def calc_nozzle_flow(positions, pressure_advance):
+    pa = pressure_advance * INV_SEG_TIME
+    last = 0.
+    out = [0.] * len(positions)
+    for i in range(1, len(positions)):
+        out[i] = last = (positions[i] - last)/pa + last
+    return out
 
 ######################################################################
 # Plotting and startup
@@ -140,11 +149,15 @@ def plot_motion():
     # Smoothed motion
     sm_positions = calc_pa(positions)
     sm_velocities = gen_deriv(sm_positions)
+    # Flow after smoothed PA
+    pa_flow = gen_deriv(calc_nozzle_flow(sm_positions,
+                                         SYSTEM_PRESSURE_ADVANCE))
     # Build plot
     times = [SEG_TIME * i for i in range(len(positions))]
     trim_lists(times, velocities, accels,
                pa_positions, pa_velocities,
-               sm_positions, sm_velocities)
+               sm_positions, sm_velocities,
+               pa_flow)
     fig, ax1 = matplotlib.pyplot.subplots(nrows=1, sharex=True)
     ax1.set_title("Extruder Velocity")
     ax1.set_ylabel('Velocity (mm/s)')
@@ -152,9 +165,11 @@ def plot_motion():
                         label='Pressure Advance', alpha=0.3)
     nom_plot, = ax1.plot(times, velocities, 'black', label='Nominal')
     sm_plot, = ax1.plot(times, sm_velocities, 'g', label='Smooth PA', alpha=0.9)
+    flow_plot, = ax1.plot(times, pa_flow, 'm', label='Flow after PA', alpha=0.9)
     fontP = matplotlib.font_manager.FontProperties()
     fontP.set_size('x-small')
-    ax1.legend(handles=[nom_plot, pa_plot, sm_plot], loc='best', prop=fontP)
+    ax1.legend(handles=[nom_plot, pa_plot, sm_plot, flow_plot],
+               loc='best', prop=fontP)
     ax1.set_xlabel('Time (s)')
     ax1.grid(True)
     fig.tight_layout()
