@@ -713,6 +713,9 @@ class LoadCellPrinterProbe:
         status.update(self._tapping_move.get_status(eventtime))
         return status
 
+    def get_load_cell(self):
+        return self._load_cell
+
 
 def load_config(config):
     return LoadCellPrinterProbe(config)

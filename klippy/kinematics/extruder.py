@@ -148,9 +148,9 @@ class PrinterExtruder:
         self.heater = pheaters.setup_heater(config, gcode_id)
         # Setup kinematic checks
         self.nozzle_diameter = config.getfloat('nozzle_diameter', above=0.)
-        filament_diameter = config.getfloat(
+        self.filament_diameter = config.getfloat(
             'filament_diameter', minval=self.nozzle_diameter)
-        self.filament_area = math.pi * (filament_diameter * .5)**2
+        self.filament_area = math.pi * (self.filament_diameter * .5)**2
         def_max_cross_section = 4. * self.nozzle_diameter**2
         def_max_extrude_ratio = def_max_cross_section / self.filament_area
         max_cross_section = config.getfloat(
@@ -192,6 +192,7 @@ class PrinterExtruder:
     def get_status(self, eventtime):
         sts = self.heater.get_status(eventtime)
         sts['can_extrude'] = self.heater.can_extrude
+        sts['filament_diameter'] = self.filament_diameter
         if self.extruder_stepper is not None:
             sts.update(self.extruder_stepper.get_status(eventtime))
         return sts
