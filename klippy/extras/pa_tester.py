@@ -4,7 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
-import collections, math
+import collections, importlib, math
 import chelper
 
 MoveData = collections.namedtuple(
@@ -154,9 +154,40 @@ class PACalibrationDataCollector:
         return self.force_samples, self.trapq_moves
 
 
+class TriangularWindowFilter:
+    def __init__(self, numpy, filter_window):
+        self.numpy = numpy
+        self.filter_window = filter_window
+
+    def smooth(self, times, values):
+        np = self.numpy
+        n = len(values)
+        if n < 2:
+            return values
+        dt = np.mean(np.diff(times))
+        half_w = 0.5 * self.filter_window
+        h = max(math.ceil(half_w / dt), 1)
+        if h < 2:
+            return values
+        frac = half_w / dt - h + 1.
+        half_tri = np.arange(h, dtype=np.float64) + frac
+        tri = np.concatenate([half_tri, half_tri[:-1][::-1]])
+        m = len(tri)
+        center = (m - 1) // 2
+        conv = np.convolve(values, tri, mode='full')
+        wsum = np.convolve(np.ones(n, dtype=np.float64), tri, mode='full')
+        return conv[center:center + n] / wsum[center:center + n]
+
+
 class PATester:
     def __init__(self, config):
         self.printer = config.get_printer()
+        try:
+            self.numpy = importlib.import_module('numpy')
+        except ImportError:
+            raise self.printer.command_error(
+                "Failed to import `numpy` module, make sure it was "
+                "installed via `~/klippy-env/bin/pip install`")
         self.force_sensor = config.get('force_sensor', None)
         self.extruder = config.get('extruder', None)
         self.extruder_test = PACalibrationExtruderTest(config)
