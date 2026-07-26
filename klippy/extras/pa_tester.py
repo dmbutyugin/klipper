@@ -15,8 +15,13 @@ FitResult = collections.namedtuple(
     'FitResult', ('tau', 'status', 'mse', 'n_evals', 'n_fits'))
 
 WindowData = collections.namedtuple(
-    'WindowData', ('velocity', 'times', 'data'))
+    'WindowData', ('velocity', 'times', 'data', 'accel'))
 
+PATestVelocityResult = collections.namedtuple(
+    'PATestVelocityResult', ('velocity', 'overshoot', 'ratios', 'n_overshoot'))
+
+PATestResult = collections.namedtuple(
+    'PATestResult', ('pressure_advance', 'overshoot', 'vel_results'))
 
 
 PA_WARNING_LOW = 0.005  # warn if PA is below this (possible detection issue)
@@ -74,7 +79,7 @@ class PACalibrationExtruderTest:
         area = math.pi * (filament_dia / 2.) ** 2
         return flow / area
 
-    def gen_test(self, filament_dia, gcmd):
+    def gen_test(self, gcmd, filament_dia, full_purge=True):
         slow_flow = self.slow_flow.get(gcmd)
         high_flow = self.high_flow.get(gcmd)
         if high_flow <= slow_flow:
@@ -92,18 +97,22 @@ class PACalibrationExtruderTest:
         slow_dist = slow_velocity * seg_time
         fast_dist = fast_velocity * seg_time
         test_repetitions = self.test_repetitions.get(gcmd)
-        segments = [(self.purge_length.get(gcmd), fast_velocity)]
-        segments += [(slow_dist, slow_velocity),
-                     (fast_dist, fast_velocity)] * test_repetitions
-        segments.append((slow_dist, slow_velocity))
-        return segments
+        extruder_moves = []
+        if full_purge:
+            extruder_moves.append((self.purge_length.get(gcmd), fast_velocity))
+        else:
+            extruder_moves.append((fast_dist, fast_velocity))
+        extruder_moves += [(slow_dist, slow_velocity),
+                           (fast_dist, fast_velocity)] * test_repetitions
+        extruder_moves.append((slow_dist, slow_velocity))
+        return extruder_moves
 
-    def run_test(self, segments):
+    def run_test(self, extruder_moves):
         toolhead = self.printer.lookup_object('toolhead')
         tpos = toolhead.get_position()
         X, Y, Z = tpos[:3]
         E = tpos[3]
-        for dist, velocity in segments:
+        for dist, velocity in extruder_moves:
             E += dist
             toolhead.move([X, Y, Z, E], velocity)
         toolhead.wait_moves()
@@ -193,12 +202,12 @@ def velocity_key(v, places=4):
     return round(v, places)
 
 
-def _match_samples_to_moves(moves, all_samples, move_window=0.):
+def _match_samples_to_moves(moves, all_samples, move_extra_window=0.):
     if not all_samples:
         return []
     all_samples.sort(key=lambda s: s[0])
     sample_times = [s[0] for s in all_samples]
-    half_window = 0.5 * move_window
+    half_window = 0.5 * move_extra_window
     results = []
     for move in moves:
         start_time = move.print_time
@@ -208,10 +217,30 @@ def _match_samples_to_moves(moves, all_samples, move_window=0.):
         window = all_samples[lo:hi]
         if window:
             results.append(WindowData(
-                velocity=move.start_v,
+                velocity=move.start_v + move.accel * move.move_t,
                 times=[s[0] for s in window],
-                data=[s[1] for s in window]))
+                data=[s[1] for s in window],
+                accel=move.accel))
     return results
+
+def _smooth_windows(np, windows, filt):
+    smoothed = []
+    for window in windows:
+        times = np.array(window.times, dtype=np.float64)
+        forces = np.array(window.data, dtype=np.float64)
+        s_data = filt.smooth(times, forces)
+        smoothed.append(WindowData(
+            velocity=window.velocity, times=times, data=s_data,
+            accel=window.accel))
+    return smoothed
+
+
+def _group_windows_by_velocity(windows):
+    vel_groups = {}
+    for window in windows:
+        vk = velocity_key(window.velocity)
+        vel_groups.setdefault(vk, []).append(window)
+    return vel_groups
 
 
 def _background_process_exec(printer, method, args):
@@ -266,34 +295,15 @@ class StepResponseTest:
     C_MIN = 0.1                # lower bound on C (gives PA_max = 1/C_MIN)
     C_MAX = 1000.              # upper bound on C (gives PA_min = 1/C_MAX)
 
-    def __init__(self, numpy, scipy, config):
+    def __init__(self, printer, numpy, scipy):
+        self.printer = printer
         self.numpy = numpy
         self.scipy = scipy
-        self.printer = config.get_printer()
-        self.filter_window = FloatParam(config, 'filter_window', 0.01, above=0.)
-        self.gcode = config.get_printer().lookup_object('gcode')
+        self.gcode = printer.lookup_object('gcode')
 
     def _filter_cv_moves(self, all_moves, skip_first=True):
         cv_moves = [m for m in all_moves if m.accel == 0.0]
         return cv_moves[(1 if skip_first else 0):]
-
-    def _smooth_windows(self, windows, filt):
-        np = self.numpy
-        smoothed = []
-        for window in windows:
-            times = np.array(window.times, dtype=np.float64)
-            forces = np.array(window.data, dtype=np.float64)
-            s_data = filt.smooth(times, forces)
-            smoothed.append(WindowData(
-                velocity=window.velocity, times=times, data=s_data))
-        return smoothed
-
-    def _group_windows_by_velocity(self, windows):
-        vel_groups = {}
-        for window in windows:
-            vk = velocity_key(window.velocity)
-            vel_groups.setdefault(vk, []).append(window)
-        return vel_groups
 
     def _prepare_window_data(self, windows, dt_limit):
         np = self.numpy
@@ -540,21 +550,26 @@ class StepResponseTest:
                     % (overall_tau, segment_time))
         gcmd.respond_info("\n".join(lines))
 
-    def run(self, gcmd, filament_diameter, extruder_test, data_collector):
+    def run(self, gcmd, extruder_test, data_collector, extruder_status,
+            signal_filter):
         reactor = self.printer.get_reactor()
         self.gcode.run_script_from_command("SET_PRESSURE_ADVANCE ADVANCE=0")
         # Execute the extrusion test and collect force and move data
-        segments = extruder_test.gen_test(filament_diameter, gcmd)
+        filament_diameter = extruder_status['filament_diameter']
+        extruder_moves = extruder_test.gen_test(gcmd, filament_diameter)
         all_samples, all_moves = data_collector.collect(
-            lambda: extruder_test.run_test(segments))
+            lambda: extruder_test.run_test(extruder_moves))
         # Keep only constant-velocity moves and match force samples to them
         cv_moves = self._filter_cv_moves(all_moves)
+        if not cv_moves:
+            raise self.printer.command_error("No move data captured")
         windows = _match_samples_to_moves(cv_moves, all_samples)
+        if not windows:
+            raise self.printer.command_error(
+                "No force samples matched to extruder moves")
         # Smooth force data of each window to reduce sensor noise
-        filt = TriangularWindowFilter(self.numpy,
-                                      self.filter_window.get(gcmd))
-        windows = self._smooth_windows(windows, filt)
-        vel_groups = self._group_windows_by_velocity(windows)
+        smoothed_windows = _smooth_windows(self.numpy, windows, signal_filter)
+        vel_groups = _group_windows_by_velocity(smoothed_windows)
         t0 = reactor.monotonic()
         # Phase 1: rough tau fit per window
         vel_fits, phase1_report_lines = _background_process_exec(
@@ -583,9 +598,284 @@ class StepResponseTest:
                       segment_time, signal_filter.filter_window)
 
 
-PA_CALIBRATION_METHODS_MAP = {
-    'step_response': StepResponseTest,
-}
+class SearchOvershootTest:
+    """Find optimal PA via binary-like search for the overshoot threshold."""
+
+    STEADY_STATE_TAIL = 0.2          # fraction of tail for steady-state mean
+    OVERSHOOT_THRESHOLD = 0.99       # integral threshold value for an overshoot
+    OVERSHOOT_VOTE_FRACTION = 0.4    # fraction of windows to declare overshoot
+    SMOOTH_TIME_SETTLE = 2.0         # extra window around flow change to test
+    ZERO_VEL_THRESHOLD = 0.1         # min velocity to keep an accel move
+    PA_SEARCH_START = 0.05           # starting PA for exponential bracketing
+    PA_SEARCH_MAX = 2.0              # hard upper limit for PA search
+    PA_SEARCH_MIN_INTERVAL = 0.002   # absolute convergence tolerance
+    PA_SEARCH_REL_TOL = 0.01         # relative convergence tolerance
+    PA_SEARCH_SHRINK_FACTOR = 0.33   # fraction of interval shifted each step
+    PA_RANGE_WARNING_FRACTION = 0.10 # PA proximity to boundary for warning
+    PA_WARNING_HIGH_MARGIN = 0.2     # warn if PA within this of PA_SEARCH_MAX
+    ACCEL_DURATION_SMOOTH_TIME_MULT = 1. # accel duration, in smooth_time units
+
+    def __init__(self, printer, numpy):
+        self.printer = printer
+        self.numpy = numpy
+        self.gcode = printer.lookup_object('gcode')
+
+    def _filter_accel_moves(self, all_moves):
+        accel_moves = []
+        for m in all_moves:
+            if m.accel == 0.:
+                continue
+            end_v = m.start_v + m.accel * m.move_t
+            if min(abs(m.start_v), abs(end_v)) < self.ZERO_VEL_THRESHOLD:
+                continue
+            accel_moves.append(m)
+        return accel_moves
+
+    def _estimate_steady_state(self, forces):
+        np = self.numpy
+        n = len(forces)
+        tail_start = int(n * (1. - self.STEADY_STATE_TAIL))
+        if tail_start < 1:
+            tail_start = 1
+        return np.mean(forces[tail_start:])
+
+    def _check_window_overshoot(self, detrended, accel):
+        np = self.numpy
+        n = len(detrended)
+        if n < 2:
+            return None
+        # Ignore the last half of detrending window, helps detecting strong
+        # undershoot when the pressure is still settling in the tail.
+        data_end = int(n * (1. - self.STEADY_STATE_TAIL * 0.5))
+        data = detrended[:data_end]
+        mean_abs = np.mean(np.abs(data))
+        if mean_abs < 1e-5:
+            return None
+        abs_mean = abs(np.mean(data))
+        ratio = abs_mean / mean_abs
+        return ratio < self.OVERSHOOT_THRESHOLD, ratio
+
+    def _check_overshoot(self, votes):
+        valid = [v for v in votes if v is not None]
+        if not valid:
+            return False, [], 0
+        overshoot_votes = [v[0] for v in valid]
+        ratios = [v[1] for v in valid]
+        n_overshoot = sum(overshoot_votes)
+        has_overshoot = (n_overshoot / len(overshoot_votes)
+                         >= self.OVERSHOOT_VOTE_FRACTION)
+        return has_overshoot, ratios, n_overshoot
+
+    def test_pa(self, gcmd, extruder_test, data_collector,
+                extruder_status, signal_filter, pressure_advance):
+        gcmd.respond_info(
+                "Test %d: pressure_advance=%.4f ..."
+                % (self._test_count + 1, pressure_advance))
+        filament_diameter = extruder_status['filament_diameter']
+        smooth_time = extruder_status['smooth_time']
+        extruder = data_collector.extruder
+        self.gcode.run_script_from_command(
+            "SET_PRESSURE_ADVANCE ADVANCE=%.6f" % pressure_advance)
+        old_pa_flag = extruder.set_enable_pa_for_extrude_only_moves(True)
+        extruder_moves = extruder_test.gen_test(
+                gcmd, filament_diameter, full_purge=not self._extruder_purged)
+        velocities = [v for _, v in extruder_moves]
+        accel_limit = (max(velocities) - min(velocities)) / (
+            self.ACCEL_DURATION_SMOOTH_TIME_MULT * smooth_time)
+        old_e_accel = extruder.set_extrude_only_accel_limit(accel_limit)
+        self._extruder_purged = True
+        all_samples, all_moves = data_collector.collect(
+            lambda: extruder_test.run_test(extruder_moves))
+        extruder.set_extrude_only_accel_limit(old_e_accel)
+        extruder.set_enable_pa_for_extrude_only_moves(old_pa_flag)
+        accel_moves = self._filter_accel_moves(all_moves)
+        if not accel_moves:
+            raise self.printer.command_error("No move data captured")
+        match_window = 2. * smooth_time * self.SMOOTH_TIME_SETTLE
+        windows = _match_samples_to_moves(
+                accel_moves, all_samples, match_window)
+        if not windows:
+            raise self.printer.command_error(
+                "No force samples matched to extruder moves")
+        smoothed_windows = _smooth_windows(self.numpy, windows, signal_filter)
+        vel_groups = _group_windows_by_velocity(smoothed_windows)
+        vel_results = []
+        detected_overshoot = False
+        for vk, group in vel_groups.items():
+            votes = []
+            for window in group:
+                steady = self._estimate_steady_state(window.data)
+                detrended = window.data - steady
+                votes.append(
+                        self._check_window_overshoot(detrended, window.accel))
+            has_overshoot, ratios, n_overshoot = self._check_overshoot(votes)
+            vel_results.append(PATestVelocityResult(
+                velocity=vk, overshoot=has_overshoot,
+                ratios=ratios, n_overshoot=n_overshoot))
+            if has_overshoot:
+                detected_overshoot = True
+            logging.info(
+                    "PA=%.4f vel=%.2f overshoot=%d n_overshoot=%d"
+                    " ratios=[%.4f..%.4f]" % (pressure_advance, vk,
+                                              has_overshoot, n_overshoot,
+                                              min(ratios) if ratios else 0.,
+                                              max(ratios) if ratios else 0.))
+        self._test_count += 1
+        gcmd.respond_info("Tested pressure_advance=%.4f -> %s" % (
+            pressure_advance,
+            'overshoot' if detected_overshoot else 'no overshoot'))
+        return PATestResult(
+            pressure_advance=pressure_advance,
+            overshoot=detected_overshoot,
+            vel_results=vel_results)
+
+    def _bracket_pa(self, test_cb):
+        pa = self.PA_SEARCH_START
+        left = 0.
+        res = test_cb(pa)
+        overshoot = res.overshoot
+        # Exponentially increase PA limit until overshoot is confirmed twice
+        while pa <= self.PA_SEARCH_MAX:
+            res = test_cb(2. * pa)
+            if res.overshoot:
+                if overshoot:
+                    return left, 1.5 * pa
+                overshoot = True
+            else:
+                overshoot = False
+                left = pa
+            pa *= 2.
+        raise self.printer.command_error(
+            "No overshoot detected up to pressure_advance=%.2f. "
+            "Check sensor or try a higher flow rate."
+            % self.PA_SEARCH_MAX)
+
+    def _contracting_search(self, test_cb, left, right):
+        while True:
+            m = 0.5 * (left + right)
+            width = right - left
+            tol = max(self.PA_SEARCH_MIN_INTERVAL, self.PA_SEARCH_REL_TOL * m)
+            if width <= tol:
+                break
+            adjust = width * self.PA_SEARCH_SHRINK_FACTOR
+            res = test_cb(m)
+            if res.overshoot:
+                right -= adjust
+            else:
+                left += adjust
+        return m
+
+    def _search_optimal_pa(self, gcmd, extruder_test, data_collector,
+                           extruder_status, signal_filter, pa_range=None):
+        results = []
+        def test_cb(pa):
+            res = self.test_pa(
+                gcmd, extruder_test, data_collector,
+                extruder_status, signal_filter, pa)
+            results.append(res)
+            return res
+        # First detect the PA range (if not provided), then run a binary-like
+        # search to determine an optimal PA value without overshoot
+        if pa_range is not None:
+            left, right = pa_range
+        else:
+            left, right = self._bracket_pa(test_cb)
+        optimal_pa = self._contracting_search(test_cb, left, right)
+        return optimal_pa, results
+
+    def _log_search_stats(self, results, optimal_pa, area):
+        rows = []
+        for idx, res in enumerate(results):
+            for vr in res.vel_results:
+                rows.append((
+                    idx + 1, res.pressure_advance, vr.velocity,
+                    min(vr.ratios) if vr.ratios else 0.,
+                    max(vr.ratios) if vr.ratios else 0.,
+                    vr.overshoot, vr.n_overshoot))
+        rows.sort(key=lambda r: (r[1], r[2]))
+        logging.info("--- PA Search Details ---")
+        logging.info("  %-4s %-10s %-8s %-12s %-8s",
+                      '#', 'PA', 'vel', 'ratios', 'overshoot')
+        logging.info("  " + "-" * 44)
+        prev_pa = None
+        marked_optimal = False
+        for tnum, pa, vk, min_r, max_r, is_overshoot, n_overshoot in rows:
+            if not marked_optimal and pa >= optimal_pa:
+                logging.info("  >> optimal PA ~ %.4f << " % optimal_pa)
+                marked_optimal = True
+            label = ('O (%d)' if is_overshoot else 'U (%d)') % n_overshoot
+            if pa != prev_pa:
+                logging.info("  %-4d %-10.4f %-8.2f %-12s %-8s" % (
+                    tnum, pa, vk, "[%.4f..%.4f]" % (min_r, max_r), label))
+                prev_pa = pa
+            else:
+                logging.info("  %-4s %-10s %-8.2f %-12s %-8s" % (
+                    '', '', vk, "[%.4f..%.4f]" % (min_r, max_r), label))
+
+    def _respond(self, gcmd, optimal_pa, pa_range):
+        lines = ["Search complete: %d tests, pressure_advance=%.4f" % (
+            self._test_count, optimal_pa)]
+        if optimal_pa < PA_WARNING_LOW:
+            lines.append(
+                "WARNING: tuned PA is very low (%.4f). This may indicate "
+                "an issue with the sensor, hotend, or filament." % optimal_pa)
+        if self.PA_WARNING_HIGH_MARGIN + optimal_pa > self.PA_SEARCH_MAX:
+            lines.append(
+                "WARNING: tuned PA is very high (%.4f, limit=%.2f). This "
+                "may indicate an issue with the sensor, hotend, or filament."
+                % (optimal_pa, self.PA_SEARCH_MAX))
+        if pa_range is not None:
+            lo, hi = pa_range
+            warn_range = 0.5 * (lo + hi) * self.PA_RANGE_WARNING_FRACTION
+            if hi < self.PA_SEARCH_MAX and hi - optimal_pa <= warn_range:
+                lines.append(
+                    "WARNING: tuned PA is too close to PA_RANGE upper "
+                    "bound (%.4f). The optimal value may be higher." % hi)
+            if lo > 0 and optimal_pa - lo <= warn_range:
+                lines.append(
+                    "WARNING: tuned PA is too close to PA_RANGE lower "
+                    "bound (%.4f). The optimal value may be lower." % lo)
+        gcmd.respond_info("\n".join(lines))
+
+    def _parse_pa_range(self, gcmd):
+        raw = gcmd.get('PA_RANGE', None)
+        if raw is None:
+            return None
+        parts = [v.strip() for v in raw.split(',')]
+        if len(parts) != 2:
+            raise self.printer.command_error(
+                "PA_RANGE requires two comma-separated values (min,max)")
+        try:
+            lo, hi = float(parts[0]), float(parts[1])
+        except ValueError:
+            raise self.printer.command_error(
+                "PA_RANGE: invalid numeric value in '%s'" % raw)
+        if lo < 0:
+            raise self.printer.command_error(
+                "PA_RANGE: min must be non-negative")
+        if hi > self.PA_SEARCH_MAX:
+            raise self.printer.command_error(
+                "PA_RANGE: max exceeds search limit (%.2f)"
+                % self.PA_SEARCH_MAX)
+        if lo >= hi:
+            raise self.printer.command_error(
+                "PA_RANGE: min must be less than max")
+        return (lo, hi)
+
+    def run(self, gcmd, extruder_test, data_collector, extruder_status,
+            signal_filter):
+        self._extruder_purged = False
+        self._test_count = 0
+        filament_diameter = extruder_status['filament_diameter']
+        area = math.pi * (filament_diameter / 2.) ** 2
+        pa_range = self._parse_pa_range(gcmd)
+        gcmd.respond_info("Searching for optimal pressure_advance...")
+        optimal_pa, results = self._search_optimal_pa(
+            gcmd, extruder_test, data_collector,
+            extruder_status, signal_filter, pa_range)
+
+        self._log_search_stats(results, optimal_pa, area)
+        self._respond(gcmd, optimal_pa, pa_range)
 
 
 class PATester:
@@ -606,18 +896,16 @@ class PATester:
                 "installed via `~/klippy-env/bin/pip install`")
         self.force_sensor = config.get('force_sensor', None)
         self.extruder = config.get('extruder', None)
-        method = config.get('method', 'step_response').lower()
-        if method not in PA_CALIBRATION_METHODS_MAP:
-            raise config.error(
-                    "Invalid method '%s' (available: %s)"
-                    % (method, ', '.join(
-                        sorted(PA_CALIBRATION_METHODS_MAP.keys()))))
-        self.default_method = method
-        self.extruder_test = PACalibrationExtruderTest(config)
+        self.filter_window = FloatParam(config, 'filter_window', 0.01,
+                                        above=0.0, maxval=0.04)
         self.methods = {
-            name: cls(self.numpy, self.scipy, config)
-            for name, cls in PA_CALIBRATION_METHODS_MAP.items()
+            'step_response': StepResponseTest(self.printer, self.numpy,
+                                              self.scipy),
+            'search_overshoot': SearchOvershootTest(self.printer, self.numpy),
         }
+        self.default_method = config.getchoice(
+            'method', list(self.methods.keys()), 'step_response')
+        self.extruder_test = PACalibrationExtruderTest(config)
         self.gcode = self.printer.lookup_object('gcode')
         self.gcode.register_command(
                 "PA_CALIBRATE", self.cmd_PA_CALIBRATE,
@@ -689,9 +977,11 @@ class PATester:
             raise self.printer.command_error(
                 "Extruder cannot extrude\n"
                 "See the 'min_extrude_temp' config option for details")
-        filament_diameter = extruder_status['filament_diameter']
         collector = PACalibrationDataCollector(self.printer, extruder, loadcell)
-        method.run(gcmd, filament_diameter, self.extruder_test, collector)
+        signal_filter = TriangularWindowFilter(
+                self.numpy, self.filter_window.get(gcmd))
+        method.run(gcmd, self.extruder_test, collector,
+                   extruder_status, signal_filter)
 
 
 def load_config(config):
