@@ -266,8 +266,9 @@ class StepResponseTest:
     C_MIN = 0.1                # lower bound on C (gives PA_max = 1/C_MIN)
     C_MAX = 1000.              # upper bound on C (gives PA_min = 1/C_MAX)
 
-    def __init__(self, numpy, config):
+    def __init__(self, numpy, scipy, config):
         self.numpy = numpy
+        self.scipy = scipy
         self.printer = config.get_printer()
         self.filter_window = FloatParam(config, 'filter_window', 0.01, above=0.)
         self.gcode = config.get_printer().lookup_object('gcode')
@@ -341,10 +342,10 @@ class StepResponseTest:
         return cost_func
 
     def _build_c_candidates(self, C0, full=False):
-        candidates = [C0, 2. * C0, 10. * C0]
+        candidates = [10., C0, 2. * C0, 10. * C0]
         if full:
             candidates += [C0 / 10., C0 / 2.]
-            candidates += [1., 10., 100.]
+            candidates += [1., 100.]
         distinct = set()
         for c in candidates:
             cr = round(c, 4)
@@ -353,26 +354,30 @@ class StepResponseTest:
         return sorted(distinct)
 
     def _run_fit(self, cost_func, n_total, c_candidates):
-        adj_params = {'C'}
-        best_params = None
+        best_params = {}
         best_cost = float('inf')
-        iter_count = [0]
-        def counted_cost(params):
-            iter_count[0] += 1
-            return cost_func(params['C'])
-        n_fits = len(c_candidates)
-        for c_start in c_candidates:
-            params = {'C': c_start}
-            res = mathutil.coordinate_descent(adj_params, params, counted_cost)
-            c_val = res['C']
-            if c_val > self.C_MIN and c_val < self.C_MAX:
+        if self.scipy is not None:
+            res = self.scipy.optimize.minimize_scalar(
+                    cost_func, bounds=(self.C_MIN, self.C_MAX),
+                    method='bounded', options={'xatol': 1e-8})
+            n_evals, n_fits = res.nfev, 1
+            best_params['C'] = res.x
+            best_cost = res.fun
+        else:
+            adj_params = {'C'}
+            iter_count = [0]
+            def counted_cost(params):
+                iter_count[0] += 1
+                return cost_func(params['C'])
+            n_fits = len(c_candidates)
+            for c_start in c_candidates:
+                res = mathutil.coordinate_descent(
+                        adj_params, {'C': c_start}, counted_cost)
                 cost = counted_cost(res)
                 if cost < best_cost:
                     best_cost = cost
                     best_params = res
-        if best_params is None:
-            return FitResult(tau=None, status='c_out_of_bounds', mse=None,
-                             n_evals=iter_count[0], n_fits=n_fits)
+            n_evals = iter_count[0]
         C_opt = best_params['C']
         mse = best_cost / n_total
         tau = 1. / C_opt
@@ -380,7 +385,7 @@ class StepResponseTest:
         if mse > self.MAX_FIT_MSE_PHASE1:
             status = 'high_mse'
         return FitResult(tau=tau, status=status, mse=mse,
-                         n_evals=iter_count[0], n_fits=n_fits)
+                         n_evals=n_evals, n_fits=n_fits)
 
     def _fit_window_phase1(self, window):
         dt = window.times - window.times[0]
@@ -592,6 +597,13 @@ class PATester:
             raise self.printer.command_error(
                 "Failed to import `numpy` module, make sure it was "
                 "installed via `~/klippy-env/bin/pip install`")
+        use_scipy = config.getboolean('use_scipy', False)
+        try:
+            self.scipy = importlib.import_module('scipy') if use_scipy else None
+        except ImportError:
+            raise self.printer.command_error(
+                "Failed to import `scipy` module, make sure it was "
+                "installed via `~/klippy-env/bin/pip install`")
         self.force_sensor = config.get('force_sensor', None)
         self.extruder = config.get('extruder', None)
         method = config.get('method', 'step_response').lower()
@@ -603,7 +615,7 @@ class PATester:
         self.default_method = method
         self.extruder_test = PACalibrationExtruderTest(config)
         self.methods = {
-            name: cls(self.numpy, config)
+            name: cls(self.numpy, self.scipy, config)
             for name, cls in PA_CALIBRATION_METHODS_MAP.items()
         }
         self.gcode = self.printer.lookup_object('gcode')
