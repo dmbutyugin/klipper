@@ -143,6 +143,7 @@ class PrinterExtruder:
         self.name = config.get_name()
         self.gcode_axis = 'E'
         self.last_position = 0.
+        self.enable_pa_for_extrude_only_moves = False
         # Setup hotend heater
         pheaters = self.printer.load_object(config, 'heaters')
         gcode_id = 'T%d' % (extruder_num,)
@@ -217,6 +218,14 @@ class PrinterExtruder:
         return self.heater
     def get_trapq(self):
         return self.trapq
+    def set_enable_pa_for_extrude_only_moves(self, enable):
+        was_enabled = self.enable_pa_for_extrude_only_moves
+        self.enable_pa_for_extrude_only_moves = enable
+        return was_enabled
+    def set_extrude_only_accel_limit(self, limit):
+        prev_limit = self.max_e_accel
+        self.max_e_accel = limit
+        return prev_limit
     def get_axis_gcode_id(self):
         return self.gcode_axis
     def is_kinematic_axis(self):
@@ -266,7 +275,7 @@ class PrinterExtruder:
         cruise_v = move.cruise_v * axis_r
         can_pressure_advance = False
         xy_move = any(move.axes_d[i] for i in self.xy_axes)
-        if axis_r > 0. and xy_move:
+        if axis_r > 0. and (xy_move or self.enable_pa_for_extrude_only_moves):
             can_pressure_advance = True
         # Queue movement (x is extruder movement, y is pressure advance flag)
         self.trapq_append(self.trapq, print_time,
