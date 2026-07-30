@@ -25,6 +25,7 @@ PATestResult = collections.namedtuple(
 
 
 PA_WARNING_LOW = 0.005  # warn if PA is below this (possible detection issue)
+FORCE_EPS = 1e-5        # effective zero force signal
 
 
 class IntParam:
@@ -79,7 +80,8 @@ class PACalibrationExtruderTest:
         area = math.pi * (filament_dia / 2.) ** 2
         return flow / area
 
-    def gen_test(self, gcmd, filament_dia, full_purge=True):
+    def gen_test(self, gcmd, filament_dia, full_purge=True,
+                 test_repetitions=None, gen_force_sig_test=False):
         slow_flow = self.slow_flow.get(gcmd)
         high_flow = self.high_flow.get(gcmd)
         if high_flow <= slow_flow:
@@ -96,15 +98,20 @@ class PACalibrationExtruderTest:
         # decelerations of extruder here for distance calculation
         slow_dist = slow_velocity * seg_time
         fast_dist = fast_velocity * seg_time
-        test_repetitions = self.test_repetitions.get(gcmd)
+        reps = (test_repetitions if test_repetitions is not None
+                else self.test_repetitions.get(gcmd))
         extruder_moves = []
         if full_purge:
             extruder_moves.append((self.purge_length.get(gcmd), fast_velocity))
         else:
             extruder_moves.append((fast_dist, fast_velocity))
         extruder_moves += [(slow_dist, slow_velocity),
-                           (fast_dist, fast_velocity)] * test_repetitions
-        extruder_moves.append((slow_dist, slow_velocity))
+                           (fast_dist, fast_velocity)] * reps
+        if gen_force_sig_test:
+            medium_velocity = 0.5 * (slow_velocity + fast_velocity)
+            medium_dist = medium_velocity * seg_time
+            extruder_moves.append((medium_dist, medium_velocity))
+            extruder_moves.append((slow_dist, slow_velocity))
         return extruder_moves
 
     def run_test(self, extruder_moves):
@@ -198,6 +205,32 @@ class TriangularWindowFilter:
         return conv[center:center + n] / wsum[center:center + n]
 
 
+def detect_force_sign(all_samples, all_moves):
+    # Detect force sensor polarity from the two last CV moves
+    # (the very last one is slower and should require less force)
+    if not all_moves:
+        return None
+    cv_moves = [m for m in all_moves if m.accel == 0.0]
+    last_moves = cv_moves[-2:]
+    if not last_moves:
+        return None
+    times = (last_moves[0].print_time, last_moves[1].print_time,
+             last_moves[1].print_time + last_moves[1].move_t)
+    last_move_samples = [s[1] for s in all_samples
+                         if times[1] <= s[0] < times[2]]
+    prev_move_samples = [s[1] for s in all_samples
+                         if times[0] <= s[0] < times[1]]
+    if len(last_move_samples) < 2 or len(prev_move_samples) < 2:
+        return None
+    diff = (sum(prev_move_samples) / len(prev_move_samples)
+            - sum(last_move_samples) / len(last_move_samples))
+    if diff > FORCE_EPS:
+        return 1
+    if diff < -FORCE_EPS:
+        return -1
+    return None
+
+
 def velocity_key(v, places=4):
     return round(v, places)
 
@@ -209,7 +242,7 @@ def _match_samples_to_moves(moves, all_samples, move_extra_window=0.):
     sample_times = [s[0] for s in all_samples]
     half_window = 0.5 * move_extra_window
     results = []
-    for move in moves:
+    for move, window_accel in moves:
         start_time = move.print_time
         end_time = move.print_time + move.move_t
         lo = bisect.bisect_left(sample_times, start_time - half_window)
@@ -220,7 +253,7 @@ def _match_samples_to_moves(moves, all_samples, move_extra_window=0.):
                 velocity=move.start_v + move.accel * move.move_t,
                 times=[s[0] for s in window],
                 data=[s[1] for s in window],
-                accel=move.accel))
+                accel=window_accel))
     return results
 
 def _smooth_windows(np, windows, filt):
@@ -301,9 +334,14 @@ class StepResponseTest:
         self.scipy = scipy
         self.gcode = printer.lookup_object('gcode')
 
-    def _filter_cv_moves(self, all_moves, skip_first=True):
-        cv_moves = [m for m in all_moves if m.accel == 0.0]
-        return cv_moves[(1 if skip_first else 0):]
+    def _filter_cv_moves(self, all_moves):
+        cv_moves = []
+        prior_accel = 0.
+        for move in all_moves:
+            if move.accel == 0.0:
+                cv_moves.append((move, prior_accel))
+            prior_accel = move.accel
+        return cv_moves
 
     def _prepare_window_data(self, windows, dt_limit):
         np = self.numpy
@@ -319,7 +357,7 @@ class StepResponseTest:
             if len(dt_fit) < 3:
                 continue
             data_range = np.max(data_fit) - np.min(data_fit)
-            if data_range < 1e-5:
+            if data_range < FORCE_EPS:
                 continue
             dt_max = dt_fit[-1]
             dt_max_global = max(dt_max_global, dt_max)
@@ -329,6 +367,20 @@ class StepResponseTest:
             window_data.append((dt_fit, data_fit, sqrt_w, data_range))
         return window_data, dt_max_global
 
+    def _solve_wls(self, window_data, C):
+        # Solve A, B, D for model A + B*exp(-C*t) + D*t via WLS
+        np = self.numpy
+        dt_fit, data_fit, sqrt_w, data_range = window_data
+        exp_term = np.exp(-C * dt_fit)
+        sw = sqrt_w
+        X = np.column_stack((sw, sw * exp_term, sw * dt_fit))
+        yw = sw * data_fit
+        XtX = np.matmul(X.T, X)
+        Xty = np.matmul(X.T, yw)
+        sol = np.linalg.solve(XtX, Xty)
+        resid = yw - np.matmul(X, sol)
+        return sol, resid
+
     def _make_cost(self, window_data):
         np = self.numpy
         def cost_func(C):
@@ -336,15 +388,9 @@ class StepResponseTest:
                 return 1e12
             try:
                 total_cost = 0.
-                for dt_fit, data_fit, sqrt_w, data_range in window_data:
-                    exp_term = np.exp(-C * dt_fit)
-                    sw = sqrt_w
-                    X = np.column_stack((sw, sw * exp_term, sw * dt_fit))
-                    yw = sw * data_fit
-                    XtX = np.matmul(X.T, X)
-                    Xty = np.matmul(X.T, yw)
-                    sol = np.linalg.solve(XtX, Xty)
-                    resid = yw - np.matmul(X, sol)
+                for wd in window_data:
+                    _, resid = self._solve_wls(wd, C)
+                    data_range = wd[3]
                     total_cost += np.sum(resid ** 2) / (data_range ** 2)
                 return total_cost
             except Exception:
@@ -397,7 +443,7 @@ class StepResponseTest:
         return FitResult(tau=tau, status=status, mse=mse,
                          n_evals=n_evals, n_fits=n_fits)
 
-    def _fit_window_phase1(self, window):
+    def _fit_window_phase1(self, window, force_sign):
         dt = window.times - window.times[0]
         dt_limit = dt[-1] * self.PHASE1_FIT_FRACTION
         window_data, dt_max = self._prepare_window_data([window], dt_limit)
@@ -407,7 +453,13 @@ class StepResponseTest:
         n_total = len(window_data[0][0])
         cost_func = self._make_cost(window_data)
         c_candidates = self._build_c_candidates(1. / dt_max, full=False)
-        return self._run_fit(cost_func, n_total, c_candidates)
+        fit = self._run_fit(cost_func, n_total, c_candidates)
+        # Validate B decay factor sign: B should oppose force_sign and accel
+        sol, _ = self._solve_wls(window_data[0], 1. / fit.tau)
+        if force_sign * window.accel * sol[1] > 0:
+            return FitResult(tau=fit.tau, status='wrong_b_sign', mse=fit.mse,
+                             n_evals=fit.n_evals, n_fits=fit.n_fits)
+        return fit
 
     def _build_phase1_report(self, vel_fits, velocity_taus, overall_tau,
                              n_evals, n_fits):
@@ -442,11 +494,11 @@ class StepResponseTest:
         lines.append("")
         return lines
 
-    def _run_phase1(self, vel_groups):
+    def _run_phase1(self, vel_groups, force_sign):
         all_fits = []
         for vk, group in vel_groups.items():
             for window in group:
-                fit = self._fit_window_phase1(window)
+                fit = self._fit_window_phase1(window, force_sign)
                 all_fits.append((vk, fit))
         velocity_taus, overall_tau = self._aggregate_taus(all_fits)
         n_evals = sum(fit.n_evals for _, fit in all_fits)
@@ -551,16 +603,26 @@ class StepResponseTest:
         gcmd.respond_info("\n".join(lines))
 
     def run(self, gcmd, extruder_test, data_collector, extruder_status,
-            signal_filter):
+            signal_filter, force_sign):
         reactor = self.printer.get_reactor()
         self.gcode.run_script_from_command("SET_PRESSURE_ADVANCE ADVANCE=0")
         # Execute the extrusion test and collect force and move data
         filament_diameter = extruder_status['filament_diameter']
-        extruder_moves = extruder_test.gen_test(gcmd, filament_diameter)
+        segment_time = extruder_test.segment_time.get(gcmd)
+        extruder_moves = extruder_test.gen_test(gcmd, filament_diameter,
+                                                gen_force_sig_test=True)
         all_samples, all_moves = data_collector.collect(
-            lambda: extruder_test.run_test(extruder_moves))
-        # Keep only constant-velocity moves and match force samples to them
-        cv_moves = self._filter_cv_moves(all_moves)
+                lambda: extruder_test.run_test(extruder_moves))
+        # Detect force_sign from the the last two of the extruder_moves
+        if not force_sign:
+            force_sign = detect_force_sign(all_samples, all_moves)
+            if not force_sign:
+                raise gcmd.error("Could not detect the sensor force direction. "
+                                 "Check sensor and filament and try again.")
+            gcmd.respond_info("Detected extrude_force_sign=%d" % force_sign)
+        # Keep only constant-velocity moves skipping the first one (purge) and
+        # the two last ones (force sign test), and match force samples to them
+        cv_moves = self._filter_cv_moves(all_moves)[1:-2]
         if not cv_moves:
             raise self.printer.command_error("No move data captured")
         windows = _match_samples_to_moves(cv_moves, all_samples)
@@ -573,7 +635,7 @@ class StepResponseTest:
         t0 = reactor.monotonic()
         # Phase 1: rough tau fit per window
         vel_fits, phase1_report_lines = _background_process_exec(
-                self.printer, self._run_phase1, (vel_groups,))
+                self.printer, self._run_phase1, (vel_groups, force_sign))
         t1 = reactor.monotonic()
         for line in phase1_report_lines:
             logging.info(line)
@@ -593,7 +655,6 @@ class StepResponseTest:
             logging.info(line)
         logging.info("Phase 2 wall time: %.3f s", t2 - t1)
         p2_velocity_taus, p2_overall_tau = self._aggregate_taus(p2_fits)
-        segment_time = extruder_test.segment_time.get(gcmd)
         self._respond(gcmd, p2_velocity_taus, p2_overall_tau, filament_diameter,
                       segment_time, signal_filter.filter_window)
 
@@ -628,7 +689,7 @@ class SearchOvershootTest:
             end_v = m.start_v + m.accel * m.move_t
             if min(abs(m.start_v), abs(end_v)) < self.ZERO_VEL_THRESHOLD:
                 continue
-            accel_moves.append(m)
+            accel_moves.append((m, m.accel))
         return accel_moves
 
     def _estimate_steady_state(self, forces):
@@ -639,7 +700,7 @@ class SearchOvershootTest:
             tail_start = 1
         return np.mean(forces[tail_start:])
 
-    def _check_window_overshoot(self, detrended, accel):
+    def _check_window_overshoot(self, detrended, accel, force_sign):
         np = self.numpy
         n = len(detrended)
         if n < 2:
@@ -649,10 +710,11 @@ class SearchOvershootTest:
         data_end = int(n * (1. - self.STEADY_STATE_TAIL * 0.5))
         data = detrended[:data_end]
         mean_abs = np.mean(np.abs(data))
-        if mean_abs < 1e-5:
+        if mean_abs < FORCE_EPS:
             return None
-        abs_mean = abs(np.mean(data))
-        ratio = abs_mean / mean_abs
+        sign = force_sign if accel < 0 else -force_sign
+        signed_mean = sign * np.mean(data)
+        ratio = signed_mean / mean_abs
         return ratio < self.OVERSHOOT_THRESHOLD, ratio
 
     def _check_overshoot(self, votes):
@@ -667,7 +729,7 @@ class SearchOvershootTest:
         return has_overshoot, ratios, n_overshoot
 
     def test_pa(self, gcmd, extruder_test, data_collector,
-                extruder_status, signal_filter, pressure_advance):
+                extruder_status, signal_filter, pressure_advance, force_sign):
         gcmd.respond_info(
                 "Test %d: pressure_advance=%.4f ..."
                 % (self._test_count + 1, pressure_advance))
@@ -683,9 +745,9 @@ class SearchOvershootTest:
         accel_limit = (max(velocities) - min(velocities)) / (
             self.ACCEL_DURATION_SMOOTH_TIME_MULT * smooth_time)
         old_e_accel = extruder.set_extrude_only_accel_limit(accel_limit)
-        self._extruder_purged = True
         all_samples, all_moves = data_collector.collect(
             lambda: extruder_test.run_test(extruder_moves))
+        self._extruder_purged = True
         extruder.set_extrude_only_accel_limit(old_e_accel)
         extruder.set_enable_pa_for_extrude_only_moves(old_pa_flag)
         accel_moves = self._filter_accel_moves(all_moves)
@@ -706,8 +768,8 @@ class SearchOvershootTest:
             for window in group:
                 steady = self._estimate_steady_state(window.data)
                 detrended = window.data - steady
-                votes.append(
-                        self._check_window_overshoot(detrended, window.accel))
+                votes.append(self._check_window_overshoot(
+                    detrended, window.accel, force_sign))
             has_overshoot, ratios, n_overshoot = self._check_overshoot(votes)
             vel_results.append(PATestVelocityResult(
                 velocity=vk, overshoot=has_overshoot,
@@ -766,12 +828,13 @@ class SearchOvershootTest:
         return m
 
     def _search_optimal_pa(self, gcmd, extruder_test, data_collector,
-                           extruder_status, signal_filter, pa_range=None):
+                           extruder_status, signal_filter, force_sign,
+                           pa_range=None):
         results = []
         def test_cb(pa):
             res = self.test_pa(
                 gcmd, extruder_test, data_collector,
-                extruder_status, signal_filter, pa)
+                extruder_status, signal_filter, pa, force_sign)
             results.append(res)
             return res
         # First detect the PA range (if not provided), then run a binary-like
@@ -862,17 +925,37 @@ class SearchOvershootTest:
                 "PA_RANGE: min must be less than max")
         return (lo, hi)
 
+    def _test_force_sign(self, gcmd, extruder_test, data_collector,
+                         filament_diameter):
+        seg_time = extruder_test.segment_time.get(gcmd)
+        extruder_moves = extruder_test.gen_test(
+                gcmd, filament_diameter, full_purge=True,
+                test_repetitions=0, gen_force_sig_test=True)
+        all_samples, all_moves = data_collector.collect(
+                lambda: extruder_test.run_test(extruder_moves))
+        force_sign = detect_force_sign(all_samples, all_moves)
+        self._extruder_purged = True
+        if not force_sign:
+            raise gcmd.error("Could not detect the sensor force direction."
+                            " Check sensor and filament and try again.")
+        return force_sign
+
     def run(self, gcmd, extruder_test, data_collector, extruder_status,
-            signal_filter):
+            signal_filter, force_sign):
         self._extruder_purged = False
         self._test_count = 0
         filament_diameter = extruder_status['filament_diameter']
         area = math.pi * (filament_diameter / 2.) ** 2
         pa_range = self._parse_pa_range(gcmd)
+        if not force_sign:
+            self.gcode.run_script_from_command("SET_PRESSURE_ADVANCE ADVANCE=0")
+            force_sign = self._test_force_sign(
+                    gcmd, extruder_test, data_collector, filament_diameter)
+            gcmd.respond_info("Detected extrude_force_sign=%d" % force_sign)
         gcmd.respond_info("Searching for optimal pressure_advance...")
         optimal_pa, results = self._search_optimal_pa(
             gcmd, extruder_test, data_collector,
-            extruder_status, signal_filter, pa_range)
+            extruder_status, signal_filter, force_sign, pa_range)
 
         self._log_search_stats(results, optimal_pa, area)
         self._respond(gcmd, optimal_pa, pa_range)
@@ -906,6 +989,8 @@ class PATester:
         self.default_method = config.getchoice(
             'method', list(self.methods.keys()), 'step_response')
         self.extruder_test = PACalibrationExtruderTest(config)
+        self.force_sign = IntParam(config, 'extrude_force_sign', 0,
+                                   minval=-1, maxval=1)
         self.gcode = self.printer.lookup_object('gcode')
         self.gcode.register_command(
                 "PA_CALIBRATE", self.cmd_PA_CALIBRATE,
@@ -980,8 +1065,9 @@ class PATester:
         collector = PACalibrationDataCollector(self.printer, extruder, loadcell)
         signal_filter = TriangularWindowFilter(
                 self.numpy, self.filter_window.get(gcmd))
+        force_sign = self.force_sign.get(gcmd)
         method.run(gcmd, self.extruder_test, collector,
-                   extruder_status, signal_filter)
+                   extruder_status, signal_filter, force_sign)
 
 
 def load_config(config):
