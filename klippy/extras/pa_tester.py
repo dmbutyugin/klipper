@@ -80,19 +80,22 @@ class PACalibrationExtruderTest:
         area = math.pi * (filament_dia / 2.) ** 2
         return flow / area
 
+    def get_slow_velocity(self, gcmd, filament_dia):
+        return self._flow_to_velocity(self.slow_flow.get(gcmd), filament_dia)
+
+    def get_fast_velocity(self, gcmd, filament_dia):
+        return self._flow_to_velocity(self.high_flow.get(gcmd), filament_dia)
+
     def gen_test(self, gcmd, filament_dia, full_purge=True,
                  test_repetitions=None, gen_force_sig_test=False):
-        slow_flow = self.slow_flow.get(gcmd)
-        high_flow = self.high_flow.get(gcmd)
-        if high_flow <= slow_flow:
-            raise gcmd.error("high_flow must be greater than slow_flow=%.1f"
-                             % slow_flow)
-        if high_flow < 2. * slow_flow:
+        slow_velocity = self.get_slow_velocity(gcmd, filament_dia)
+        fast_velocity = self.get_fast_velocity(gcmd, filament_dia)
+        if fast_velocity <= slow_velocity:
+            raise gcmd.error("high_flow must be greater than slow_flow")
+        if fast_velocity < 2. * slow_velocity:
             gcmd.respond_info(
                 "WARNING: high_flow is less than 2x slow_flow, PA "
                 "estimation may be unreliable")
-        slow_velocity = self._flow_to_velocity(slow_flow, filament_dia)
-        fast_velocity = self._flow_to_velocity(high_flow, filament_dia)
         seg_time = self.segment_time.get(gcmd)
         # This is a bit approximate - we ignore accelerations and
         # decelerations of extruder here for distance calculation
@@ -328,7 +331,7 @@ class StepResponseTest:
     C_MIN = 0.1                # lower bound on C (gives PA_max = 1/C_MIN)
     C_MAX = 1000.              # upper bound on C (gives PA_min = 1/C_MAX)
 
-    def __init__(self, printer, numpy, scipy):
+    def __init__(self, printer, numpy, scipy=None):
         self.printer = printer
         self.numpy = numpy
         self.scipy = scipy
@@ -665,7 +668,7 @@ class SearchOvershootTest:
     STEADY_STATE_TAIL = 0.2          # fraction of tail for steady-state mean
     OVERSHOOT_THRESHOLD = 0.99       # integral threshold value for an overshoot
     OVERSHOOT_VOTE_FRACTION = 0.4    # fraction of windows to declare overshoot
-    SMOOTH_TIME_SETTLE = 2.0         # extra window around flow change to test
+    FORCE_SMOOTH_TIME_SETTLE = 2.0   # extra window around flow change to test
     ZERO_VEL_THRESHOLD = 0.1         # min velocity to keep an accel move
     PA_SEARCH_START = 0.05           # starting PA for exponential bracketing
     PA_SEARCH_MAX = 2.0              # hard upper limit for PA search
@@ -675,10 +678,15 @@ class SearchOvershootTest:
     PA_RANGE_WARNING_FRACTION = 0.10 # PA proximity to boundary for warning
     PA_WARNING_HIGH_MARGIN = 0.2     # warn if PA within this of PA_SEARCH_MAX
     ACCEL_DURATION_SMOOTH_TIME_MULT = 1. # accel duration, in smooth_time units
+    PA_CORRECTED_REL_START = 0.5     # relative corrected PA search start
+    PA_CORRECTED_REL_TOL = 0.001     # relative corrected PA search tolerance
+    SIMULATION_SEG_TIME = 0.0001     # simulation time step (s)
+    CORRECTION_MIN_FRACTION = 0.05   # min PA correction fraction to report
 
-    def __init__(self, printer, numpy):
+    def __init__(self, printer, numpy, scipy=None):
         self.printer = printer
         self.numpy = numpy
+        self.scipy = scipy
         self.gcode = printer.lookup_object('gcode')
 
     def _filter_accel_moves(self, all_moves):
@@ -691,6 +699,10 @@ class SearchOvershootTest:
                 continue
             accel_moves.append((m, m.accel))
         return accel_moves
+
+    def _get_force_settle_time(self, smooth_time, signal_filter):
+        return self.FORCE_SMOOTH_TIME_SETTLE * max(smooth_time,
+                                                   signal_filter.filter_window)
 
     def _estimate_steady_state(self, forces):
         np = self.numpy
@@ -742,18 +754,15 @@ class SearchOvershootTest:
         extruder_moves = extruder_test.gen_test(
                 gcmd, filament_diameter, full_purge=not self._extruder_purged)
         velocities = [v for _, v in extruder_moves]
-        accel_limit = (max(velocities) - min(velocities)) / (
-            self.ACCEL_DURATION_SMOOTH_TIME_MULT * smooth_time)
-        old_e_accel = extruder.set_extrude_only_accel_limit(accel_limit)
         all_samples, all_moves = data_collector.collect(
             lambda: extruder_test.run_test(extruder_moves))
         self._extruder_purged = True
-        extruder.set_extrude_only_accel_limit(old_e_accel)
         extruder.set_enable_pa_for_extrude_only_moves(old_pa_flag)
         accel_moves = self._filter_accel_moves(all_moves)
         if not accel_moves:
             raise self.printer.command_error("No move data captured")
-        match_window = 2. * smooth_time * self.SMOOTH_TIME_SETTLE
+        match_window = 2. * self._get_force_settle_time(smooth_time,
+                                                        signal_filter)
         windows = _match_samples_to_moves(
                 accel_moves, all_samples, match_window)
         if not windows:
@@ -846,7 +855,7 @@ class SearchOvershootTest:
         optimal_pa = self._contracting_search(test_cb, left, right)
         return optimal_pa, results
 
-    def _log_search_stats(self, results, optimal_pa, area):
+    def _log_search_stats(self, results, optimal_pa, corrected_pa, area):
         rows = []
         for idx, res in enumerate(results):
             for vr in res.vel_results:
@@ -874,8 +883,106 @@ class SearchOvershootTest:
             else:
                 logging.info("  %-4s %-10s %-8.2f %-12s %-8s" % (
                     '', '', vk, "[%.4f..%.4f]" % (min_r, max_r), label))
+        logging.info(
+                "  Simulation-corrected PA: %.4f (raw: %.4f)" % (
+                    corrected_pa, optimal_pa))
 
-    def _respond(self, gcmd, optimal_pa, pa_range):
+    # Simulation helpers for PA correction
+
+    def _calc_pa(self, times, positions, extruder_pa, smooth_time):
+        # Calculate PA-compensated extruder positions
+        np = self.numpy
+        pa_dt = extruder_pa / self.SIMULATION_SEG_TIME
+        pos_diffs = np.diff(positions)
+        pa_positions = positions + pa_dt * np.append(pos_diffs, pos_diffs[-1])
+        pa_filter = TriangularWindowFilter(np, smooth_time)
+        # Smooth velocity and not positions, since triangular filter will smooth
+        # linear function incorrectly at boundaries (result is non-linear)
+        return np.cumsum(np.append(
+            pa_positions[0], pa_filter.smooth(times, np.diff(pa_positions))))
+
+    def _calc_nozzle_flow(self, positions, system_pa):
+        # Simulate nozzle first-order pressure response
+        np = self.numpy
+        dt_pa = self.SIMULATION_SEG_TIME / system_pa
+        if self.scipy is not None:
+            return self.scipy.signal.lfilter(
+                    [dt_pa], [1., -(1. - dt_pa)], positions)
+        n = len(positions)
+        out = np.empty(n, dtype=np.float64)
+        out[0] = last = positions[0]
+        for i in range(1, n):
+            last += (positions[i] - last) * dt_pa
+            out[i] = last
+        return out
+
+    def _simulate_velocity_step(self, slow_vel, fast_vel, accel, smooth_time,
+                                signal_filter):
+        # Generate a synthetic velocity step from slow to fast velocity
+        np = self.numpy
+        seg_time = self.SIMULATION_SEG_TIME
+        accel_time = (fast_vel - slow_vel) / accel
+        settle_time = self._get_force_settle_time(smooth_time, signal_filter)
+        total_duration = 2. * settle_time + accel_time
+        n_samples = int(total_duration / seg_time + 0.5)
+        times = np.arange(n_samples, dtype=np.float64) * seg_time
+        accel_start = settle_time
+        accel_end = accel_start + accel_time
+        velocities = np.where(times > accel_end, fast_vel, slow_vel + np.where(
+            times < accel_start, 0., accel * (times - accel_start)))
+        return times, velocities
+
+    def _simulate_force_signal(self, times, velocities, configured_pa,
+                               system_pa, smooth_time, signal_filter):
+        # Simulate the full PA chain and return detrended force signal
+        np = self.numpy
+        cmd_pos = np.cumsum(velocities) * self.SIMULATION_SEG_TIME
+        smoothed_pa = self._calc_pa(times, cmd_pos, configured_pa, smooth_time)
+        actual_pos = self._calc_nozzle_flow(smoothed_pa, system_pa)
+        # Force in mm (without stiffness coefficient)
+        force = smoothed_pa - actual_pos
+        filtered_force = signal_filter.smooth(times, force)
+        steady = self._estimate_steady_state(filtered_force)
+        return filtered_force - steady
+
+    def _simulate_check_overshoot(self, configured_pa, system_pa, smooth_time,
+                                  signal_filter, times, velocities):
+        # Simulate PA chain for a velocity step and check for overshoot
+        detrended = self._simulate_force_signal(
+            times, velocities, configured_pa, system_pa,
+            smooth_time, signal_filter)
+        # accel and force_sign values are just hardcoded conventions to
+        # represent a generated acceleration direction and a maching force
+        return self._check_window_overshoot(detrended, accel=1., force_sign=1.)
+
+    def _find_corrected_pa(self, detected_pa, smooth_time, signal_filter,
+                           slow_velocity, fast_velocity, accel):
+        # Binary search over system_pa to find corrected PA value
+        times, velocities = self._simulate_velocity_step(
+            slow_velocity, fast_velocity, accel, smooth_time, signal_filter)
+        def sim_test_cb(system_pa):
+            res = self._simulate_check_overshoot(
+                    detected_pa, system_pa, smooth_time, signal_filter,
+                    times, velocities)
+            if res is None:
+                return False
+            return res[0]
+        left = detected_pa * self.PA_CORRECTED_REL_START
+        right = detected_pa
+        if not sim_test_cb(left) or sim_test_cb(right):
+            return detected_pa
+        while True:
+            m = 0.5 * (left + right)
+            tol = max(self.PA_SEARCH_MIN_INTERVAL,
+                      self.PA_CORRECTED_REL_TOL * m)
+            if right - left <= tol:
+                return m
+            if sim_test_cb(m):
+                left = m
+            else:
+                right = m
+
+    def _respond(self, gcmd, optimal_pa, corrected_pa, pa_range):
         lines = ["Search complete: %d tests, pressure_advance=%.4f" % (
             self._test_count, optimal_pa)]
         if optimal_pa < PA_WARNING_LOW:
@@ -887,6 +994,11 @@ class SearchOvershootTest:
                 "WARNING: tuned PA is very high (%.4f, limit=%.2f). This "
                 "may indicate an issue with the sensor, hotend, or filament."
                 % (optimal_pa, self.PA_SEARCH_MAX))
+        if (corrected_pa != optimal_pa
+                and abs(corrected_pa - optimal_pa)
+                    > self.CORRECTION_MIN_FRACTION * optimal_pa):
+            lines.append("PA correction: pressure_advance=%.4f" % corrected_pa)
+            lines.append("(accounts for force data filtering)")
         if pa_range is not None:
             lo, hi = pa_range
             warn_range = 0.5 * (lo + hi) * self.PA_RANGE_WARNING_FRACTION
@@ -946,19 +1058,34 @@ class SearchOvershootTest:
         self._test_count = 0
         filament_diameter = extruder_status['filament_diameter']
         area = math.pi * (filament_diameter / 2.) ** 2
+        smooth_time = extruder_status['smooth_time']
         pa_range = self._parse_pa_range(gcmd)
-        if not force_sign:
-            self.gcode.run_script_from_command("SET_PRESSURE_ADVANCE ADVANCE=0")
-            force_sign = self._test_force_sign(
-                    gcmd, extruder_test, data_collector, filament_diameter)
-            gcmd.respond_info("Detected extrude_force_sign=%d" % force_sign)
-        gcmd.respond_info("Searching for optimal pressure_advance...")
-        optimal_pa, results = self._search_optimal_pa(
-            gcmd, extruder_test, data_collector,
-            extruder_status, signal_filter, force_sign, pa_range)
 
-        self._log_search_stats(results, optimal_pa, area)
-        self._respond(gcmd, optimal_pa, pa_range)
+        slow_velocity = extruder_test.get_slow_velocity(gcmd, filament_diameter)
+        fast_velocity = extruder_test.get_fast_velocity(gcmd, filament_diameter)
+        accel_limit = (fast_velocity - slow_velocity) / (
+            self.ACCEL_DURATION_SMOOTH_TIME_MULT * smooth_time)
+        extruder = data_collector.extruder
+        old_e_accel = extruder.set_extrude_only_accel_limit(accel_limit)
+        self.gcode.run_script_from_command("SET_PRESSURE_ADVANCE ADVANCE=0")
+
+        try:
+            if not force_sign:
+                force_sign = self._test_force_sign(
+                        gcmd, extruder_test, data_collector, filament_diameter)
+                gcmd.respond_info("Detected extrude_force_sign=%d" % force_sign)
+            gcmd.respond_info("Searching for optimal pressure_advance...")
+            optimal_pa, results = self._search_optimal_pa(
+                gcmd, extruder_test, data_collector,
+                extruder_status, signal_filter, force_sign, pa_range)
+        finally:
+            extruder.set_extrude_only_accel_limit(old_e_accel)
+
+        corrected_pa = self._find_corrected_pa(
+                optimal_pa, smooth_time, signal_filter,
+                slow_velocity, fast_velocity, accel_limit)
+        self._log_search_stats(results, optimal_pa, corrected_pa, area)
+        self._respond(gcmd, optimal_pa, corrected_pa, pa_range)
 
 
 class PATester:
@@ -982,10 +1109,11 @@ class PATester:
         self.filter_window = FloatParam(config, 'filter_window', 0.01,
                                         above=0.0, maxval=0.04)
         self.methods = {
-            'step_response': StepResponseTest(self.printer, self.numpy,
-                                              self.scipy),
-            'search_overshoot': SearchOvershootTest(self.printer, self.numpy),
-        }
+                'step_response': StepResponseTest(self.printer, self.numpy,
+                                                  self.scipy),
+                'search_overshoot': SearchOvershootTest(self.printer,
+                                                        self.numpy, self.scipy),
+            }
         self.default_method = config.getchoice(
             'method', list(self.methods.keys()), 'step_response')
         self.extruder_test = PACalibrationExtruderTest(config)
