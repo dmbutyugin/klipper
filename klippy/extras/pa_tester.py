@@ -335,7 +335,7 @@ class StepResponseTest:
         self.printer = printer
         self.numpy = numpy
         self.scipy = scipy
-        self.gcode = printer.lookup_object('gcode')
+        self.last_measured_pressure_advance = None
 
     def _filter_cv_moves(self, all_moves):
         cv_moves = []
@@ -603,12 +603,14 @@ class StepResponseTest:
                     "(%.1f). The exponential decay may not have settled; "
                     "increase segment_time for a more reliable result."
                     % (overall_tau, segment_time))
+        else:
+            lines.append("Failed to detect Pressure Advance value.")
+            lines.append("Check sensor and filament and try again.")
         gcmd.respond_info("\n".join(lines))
 
     def run(self, gcmd, extruder_test, data_collector, extruder_status,
             signal_filter, force_sign):
         reactor = self.printer.get_reactor()
-        self.gcode.run_script_from_command("SET_PRESSURE_ADVANCE ADVANCE=0")
         # Execute the extrusion test and collect force and move data
         filament_diameter = extruder_status['filament_diameter']
         segment_time = extruder_test.segment_time.get(gcmd)
@@ -660,6 +662,16 @@ class StepResponseTest:
         p2_velocity_taus, p2_overall_tau = self._aggregate_taus(p2_fits)
         self._respond(gcmd, p2_velocity_taus, p2_overall_tau, filament_diameter,
                       segment_time, signal_filter.filter_window)
+        if p2_velocity_taus:
+            self.last_measured_pressure_advance = sorted(
+                    [float(v) for v in p2_velocity_taus.values()])
+        return p2_overall_tau
+
+    def get_status(self, eventtime):
+        if self.last_measured_pressure_advance is None:
+            return {}
+        return {'last_measured_pressure_advance':
+                    self.last_measured_pressure_advance}
 
 
 class SearchOvershootTest:
@@ -688,6 +700,8 @@ class SearchOvershootTest:
         self.numpy = numpy
         self.scipy = scipy
         self.gcode = printer.lookup_object('gcode')
+        self.last_measured_pressure_advance = None
+        self.last_corrected_pressure_advance = None
 
     def _filter_accel_moves(self, all_moves):
         accel_moves = []
@@ -994,9 +1008,7 @@ class SearchOvershootTest:
                 "WARNING: tuned PA is very high (%.4f, limit=%.2f). This "
                 "may indicate an issue with the sensor, hotend, or filament."
                 % (optimal_pa, self.PA_SEARCH_MAX))
-        if (corrected_pa != optimal_pa
-                and abs(corrected_pa - optimal_pa)
-                    > self.CORRECTION_MIN_FRACTION * optimal_pa):
+        if corrected_pa is not None:
             lines.append("PA correction: pressure_advance=%.4f" % corrected_pa)
             lines.append("(accounts for force data filtering)")
         if pa_range is not None:
@@ -1054,6 +1066,8 @@ class SearchOvershootTest:
 
     def run(self, gcmd, extruder_test, data_collector, extruder_status,
             signal_filter, force_sign):
+        self.last_measured_pressure_advance = None
+        self.last_corrected_pressure_advance = None
         self._extruder_purged = False
         self._test_count = 0
         filament_diameter = extruder_status['filament_diameter']
@@ -1081,11 +1095,31 @@ class SearchOvershootTest:
         finally:
             extruder.set_extrude_only_accel_limit(old_e_accel)
 
+        self.gcode.run_script_from_command("SET_PRESSURE_ADVANCE ADVANCE=%.6f" %
+                                           extruder_status['pressure_advance'])
+
+        self.last_measured_pressure_advance = float(optimal_pa)
         corrected_pa = self._find_corrected_pa(
                 optimal_pa, smooth_time, signal_filter,
                 slow_velocity, fast_velocity, accel_limit)
         self._log_search_stats(results, optimal_pa, corrected_pa, area)
+        if (abs(corrected_pa - optimal_pa) <
+            self.CORRECTION_MIN_FRACTION * optimal_pa):
+            corrected_pa = None
         self._respond(gcmd, optimal_pa, corrected_pa, pa_range)
+        if corrected_pa is not None:
+            self.last_corrected_pressure_advance = float(corrected_pa)
+        return corrected_pa or optimal_pa
+
+    def get_status(self, eventtime):
+        status = {}
+        if self.last_measured_pressure_advance is not None:
+            status['last_measured_pressure_advance'] = \
+                    [self.last_measured_pressure_advance]
+        if self.last_corrected_pressure_advance is not None:
+            status['last_corrected_pressure_advance'] = \
+                    self.last_corrected_pressure_advance
+        return status
 
 
 class PATester:
@@ -1119,7 +1153,12 @@ class PATester:
         self.extruder_test = PACalibrationExtruderTest(config)
         self.force_sign = IntParam(config, 'extrude_force_sign', 0,
                                    minval=-1, maxval=1)
+        self.last_pressure_advance = None
+        self.last_pa_test_method_name = None
         self.gcode = self.printer.lookup_object('gcode')
+        self.gcode.register_command(
+                "TEST_PRESSURE_ADVANCE", self.cmd_TEST_PRESSURE_ADVANCE,
+                desc=self.cmd_TEST_PRESSURE_ADVANCE_help)
         self.gcode.register_command(
                 "PA_CALIBRATE", self.cmd_PA_CALIBRATE,
                 desc=self.cmd_PA_CALIBRATE_help)
@@ -1174,28 +1213,62 @@ class PATester:
                 % (names,))
         return lc_objects[0][0]
 
-    cmd_PA_CALIBRATE_help = "Calibrate Pressure Advance using loadcell data"
-    def cmd_PA_CALIBRATE(self, gcmd):
+    def get_status(self, eventtime):
+        status = {k: v
+                  for k, v in {'last_pressure_advance_test':
+                                self.last_pa_test_method_name,
+                               'last_pressure_advance':
+                                self.last_pressure_advance}.items()
+                  if v is not None}
+        if self.last_pa_test_method_name is not None:
+            method = self.methods.get(self.last_pa_test_method_name)
+            status.update(method.get_status(eventtime))
+        return status
+
+    def _run_pa_test(self, gcmd):
         method_name = gcmd.get('METHOD', self.default_method).lower()
         method = self.methods.get(method_name)
         if method is None:
             raise self.printer.command_error(
-                "Unknown PA_CALIBRATE method '%s' (available: %s)"
+                "Unknown method '%s' (available: %s)"
                 % (method_name, ', '.join(sorted(self.methods.keys()))))
         extruder = self._resolve_extruder(gcmd)
         loadcell, _ = self._resolve_loadcell(gcmd)
         systime = self.printer.get_reactor().monotonic()
         extruder_status = extruder.get_status(systime)
+        if 'smooth_time' not in extruder_status:
+            raise gcmd.error("Active extruder does not have a stepper")
         if not extruder_status['can_extrude']:
-            raise self.printer.command_error(
+            raise gcmd.error(
                 "Extruder cannot extrude\n"
                 "See the 'min_extrude_temp' config option for details")
         collector = PACalibrationDataCollector(self.printer, extruder, loadcell)
         signal_filter = TriangularWindowFilter(
                 self.numpy, self.filter_window.get(gcmd))
         force_sign = self.force_sign.get(gcmd)
-        method.run(gcmd, self.extruder_test, collector,
-                   extruder_status, signal_filter, force_sign)
+        self.last_pressure_advance = None
+        pressure_advance = method.run(
+                gcmd, self.extruder_test, collector, extruder_status,
+                signal_filter, force_sign)
+        if pressure_advance is not None:
+            self.last_pressure_advance = float(pressure_advance)
+        self.last_pa_test_method_name = method_name
+
+    cmd_TEST_PRESSURE_ADVANCE_help = "Measures the optimal Pressure Advance" + \
+            " for the currently loaded filament using the hotend loadcell"
+    def cmd_TEST_PRESSURE_ADVANCE(self, gcmd):
+        self._run_pa_test(gcmd)
+
+    cmd_PA_CALIBRATE_help = "Calibrate Pressure Advance for the currently" + \
+            " loaded filament using the hotend loadcell"
+    def cmd_PA_CALIBRATE(self, gcmd):
+        self._run_pa_test(gcmd)
+        self._apply_pa_result(self.last_pressure_advance)
+
+    def _apply_pa_result(self, pressure_advance):
+        if pressure_advance is not None:
+            self.gcode.run_script_from_command(
+                "SET_PRESSURE_ADVANCE ADVANCE=%.6f" % pressure_advance)
 
 
 def load_config(config):
