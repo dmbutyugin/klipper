@@ -1697,6 +1697,49 @@ information.
 #   the captured position (in mm/s). Default is 50.0 mm/s.
 ```
 
+### [pa_tester]
+
+Calibrate Pressure Advance using a load cell force sensor. See the
+[command reference](G-Codes.md#pa_tester) for more information.
+
+```
+[pa_tester]
+#purge_length:
+#   The purge distance in mm at the start of the test.
+#high_flow:
+#   The test high flow rate in mm^3/s. This parameter must be provided.
+#slow_flow: 2.
+#   The slow flow rate in mm^3/s during calibration moves.
+#   Default is 2 mm^3/s.
+#method: step_response
+#   The calibration method. Valid options are "step_response" (fit
+#   an exponential decay model to force data) or "search_overshoot"
+#   (iteratively search for the PA where overshoot first begins).
+#   Default method is step_response.
+#segment_time: 0.5
+#   The duration (in seconds) of each slow/high flow segment.
+#   Default is 0.5 s.
+#test_repetitions: 10
+#   The number of slow/high flow segment pairs to repeat.
+#   Default is 10.
+#filter_window: 0.01
+#   The force smoothing filter window length (in seconds).
+#   Default is 0.01 s.
+#extrude_force_sign: 0
+#   The polarity of the force sensor signal. Set to 1 if the sensor
+#   reports increasing values during extrusion, -1 if decreasing, or
+#   0 to auto-detect at runtime. Default is 0 (auto-detect).
+#force_sensor:
+#   The name of the load cell force sensor to use. If not specified,
+#   Klipper will auto-detect a single configured load cell.
+#extruder:
+#   The name of the extruder to test. If not specified, the active
+#   extruder is used.
+#use_scipy: False
+#   If True, will use some scipy optimized functions (requires scipy
+#   to be installed). The default is not to use scipy.
+```
+
 ### [firmware_retraction]
 
 Firmware filament retraction. This enables G10 (retract) and G11

@@ -387,6 +387,24 @@ The following information is available in
 [pwm_tool some_name](Config_Reference.md#pwm_tool) objects:
 - `value`: The "value" of the pin, as set by a `SET_PIN` command.
 
+## pa_tester
+
+The following information is available in the
+[pa_tester](Config_Reference.md#pa_tester) object:
+- `last_pressure_advance_test`: The name of the method used in the last
+  Pressure Advance test. It is one of the following strings: "step_response",
+  "search_overshoot". This field will be null if no test has been run yet.
+- `last_pressure_advance`: The last detected pressure advance value. This field
+   will be null if no test has been run yet.
+- `last_measured_pressure_advance`: A list of one or more pressure advance
+  values measured during the last test. For the "step_response" method this
+  is a list of different PA values for different flow rates. For the
+  "search_overshoot" method this is a single-element list containing the PA
+  not causing measurable overshoot of hotend pressure.
+- `last_corrected_pressure_advance`: The pressure advance value compensated
+  for signal filtering. This field is only present for the "search_overshoot"
+  method and only when the correction was significant.
+
 ## palette2
 
 The following information is available in the

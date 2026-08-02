@@ -1152,6 +1152,34 @@ the paused state is fresh for each print.
 #### CANCEL_PRINT
 `CANCEL_PRINT`: Cancels the current print.
 
+### [pa_tester]
+
+The following commands are available when a
+[pa_tester config section](Config_Reference.md#pa_tester) is enabled:
+
+#### TEST_PRESSURE_ADVANCE
+`TEST_PRESSURE_ADVANCE [METHOD=<method>] [EXTRUDER=<name>]
+[FORCE_SENSOR=<name>] [PA_RANGE=<min>,<max>] [SLOW_FLOW=<flow>]
+[HIGH_FLOW=<flow>] [PURGE_LENGTH=<length>] [SEGMENT_TIME=<time>]
+[TEST_REPETITIONS=<count>] [FILTER_WINDOW=<window>]
+[EXTRUDE_FORCE_SIGN=<sign>]`: Measure the optimal Pressure Advance
+using a load cell force sensor. The METHOD parameter selects the
+calibration method (default: `step_response`). The `search_overshoot`
+method additionally accepts `PA_RANGE` to constrain the search range.
+The measured value is stored in the pa_tester status but is not applied.
+See configuration reference for descriptions of the configuration options
+that can be overridden via the parameters of this command.
+
+#### PA_CALIBRATE
+`PA_CALIBRATE [METHOD=<method>] [EXTRUDER=<name>] [FORCE_SENSOR=<name>]
+[PA_RANGE=<min>,<max>] [SLOW_FLOW=<flow>] [HIGH_FLOW=<flow>]
+[PURGE_LENGTH=<length>] [SEGMENT_TIME=<time>]
+[TEST_REPETITIONS=<count>] [FILTER_WINDOW=<window>]
+[EXTRUDE_FORCE_SIGN=<sign>]`: Similarly to `TEST_PRESSURE_ADVANCE`,
+measures the optimal Pressure Advance using a load cell force sensor.
+In addition, the measured optimal pressure advance value is applied to
+the tested extruder immediately.
+
 ### [pid_calibrate]
 
 The pid_calibrate module is automatically loaded if a heater is defined
