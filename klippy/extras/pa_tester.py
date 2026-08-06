@@ -26,6 +26,7 @@ PATestResult = collections.namedtuple(
 
 PA_WARNING_LOW = 0.005  # warn if PA is below this (possible detection issue)
 FORCE_EPS = 1e-5        # effective zero force signal
+ACCEL_DURATION_SMOOTH_TIME_MULT = 1. # accel duration, in smooth_time units
 
 
 class IntParam:
@@ -85,6 +86,12 @@ class PACalibrationExtruderTest:
 
     def get_fast_velocity(self, gcmd, filament_dia):
         return self._flow_to_velocity(self.high_flow.get(gcmd), filament_dia)
+
+    def get_accel_limit(self, gcmd, filament_dia, smooth_time):
+        slow_velocity = self.get_slow_velocity(gcmd, filament_dia)
+        fast_velocity = self.get_fast_velocity(gcmd, filament_dia)
+        return (fast_velocity - slow_velocity) / (
+                ACCEL_DURATION_SMOOTH_TIME_MULT * smooth_time)
 
     def gen_test(self, gcmd, filament_dia, full_purge=True,
                  test_repetitions=None, gen_force_sig_test=False):
@@ -616,8 +623,16 @@ class StepResponseTest:
         segment_time = extruder_test.segment_time.get(gcmd)
         extruder_moves = extruder_test.gen_test(gcmd, filament_diameter,
                                                 gen_force_sig_test=True)
-        all_samples, all_moves = data_collector.collect(
-                lambda: extruder_test.run_test(extruder_moves))
+        smooth_time = extruder_status['smooth_time']
+        accel_limit = extruder_test.get_accel_limit(gcmd, filament_diameter,
+                                                    smooth_time)
+        extruder = data_collector.extruder
+        old_e_accel = extruder.set_extrude_only_accel_limit(accel_limit)
+        try:
+            all_samples, all_moves = data_collector.collect(
+                    lambda: extruder_test.run_test(extruder_moves))
+        finally:
+            extruder.set_extrude_only_accel_limit(old_e_accel)
         # Detect force_sign from the the last two of the extruder_moves
         if not force_sign:
             force_sign = detect_force_sign(all_samples, all_moves)
@@ -689,7 +704,6 @@ class SearchOvershootTest:
     PA_SEARCH_SHRINK_FACTOR = 0.33   # fraction of interval shifted each step
     PA_RANGE_WARNING_FRACTION = 0.10 # PA proximity to boundary for warning
     PA_WARNING_HIGH_MARGIN = 0.2     # warn if PA within this of PA_SEARCH_MAX
-    ACCEL_DURATION_SMOOTH_TIME_MULT = 1. # accel duration, in smooth_time units
     PA_CORRECTED_REL_START = 0.5     # relative corrected PA search start
     PA_CORRECTED_REL_TOL = 0.001     # relative corrected PA search tolerance
     SIMULATION_SEG_TIME = 0.0001     # simulation time step (s)
@@ -1075,10 +1089,8 @@ class SearchOvershootTest:
         smooth_time = extruder_status['smooth_time']
         pa_range = self._parse_pa_range(gcmd)
 
-        slow_velocity = extruder_test.get_slow_velocity(gcmd, filament_diameter)
-        fast_velocity = extruder_test.get_fast_velocity(gcmd, filament_diameter)
-        accel_limit = (fast_velocity - slow_velocity) / (
-            self.ACCEL_DURATION_SMOOTH_TIME_MULT * smooth_time)
+        accel_limit = extruder_test.get_accel_limit(gcmd, filament_diameter,
+                                                    smooth_time)
         extruder = data_collector.extruder
         old_e_accel = extruder.set_extrude_only_accel_limit(accel_limit)
         self.gcode.run_script_from_command("SET_PRESSURE_ADVANCE ADVANCE=0")
@@ -1099,6 +1111,8 @@ class SearchOvershootTest:
                                            extruder_status['pressure_advance'])
 
         self.last_measured_pressure_advance = float(optimal_pa)
+        slow_velocity = extruder_test.get_slow_velocity(gcmd, filament_diameter)
+        fast_velocity = extruder_test.get_fast_velocity(gcmd, filament_diameter)
         corrected_pa = self._find_corrected_pa(
                 optimal_pa, smooth_time, signal_filter,
                 slow_velocity, fast_velocity, accel_limit)
