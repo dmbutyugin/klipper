@@ -12,10 +12,10 @@ MoveData = collections.namedtuple(
     'MoveData', ('print_time', 'move_t', 'start_v', 'accel'))
 
 FitResult = collections.namedtuple(
-    'FitResult', ('tau', 'status', 'mse', 'n_evals', 'n_fits'))
+    'FitResult', ('tau', 'status', 'mse', 'n_evals', 'n_fits', 'solutions'))
 
 WindowData = collections.namedtuple(
-    'WindowData', ('velocity', 'times', 'data', 'accel'))
+    'WindowData', ('velocity', 'times', 'data', 'accel', 'idx'))
 
 PATestVelocityResult = collections.namedtuple(
     'PATestVelocityResult', ('velocity', 'overshoot', 'ratios', 'n_overshoot'))
@@ -252,7 +252,7 @@ def _match_samples_to_moves(moves, all_samples, move_extra_window=0.):
     sample_times = [s[0] for s in all_samples]
     half_window = 0.5 * move_extra_window
     results = []
-    for move, window_accel in moves:
+    for idx, (move, window_accel) in enumerate(moves):
         start_time = move.print_time
         end_time = move.print_time + move.move_t
         lo = bisect.bisect_left(sample_times, start_time - half_window)
@@ -263,7 +263,7 @@ def _match_samples_to_moves(moves, all_samples, move_extra_window=0.):
                 velocity=move.start_v + move.accel * move.move_t,
                 times=[s[0] for s in window],
                 data=[s[1] for s in window],
-                accel=window_accel))
+                accel=window_accel, idx=idx))
     return results
 
 def _smooth_windows(np, windows, filt):
@@ -274,7 +274,7 @@ def _smooth_windows(np, windows, filt):
         s_data = filt.smooth(times, forces)
         smoothed.append(WindowData(
             velocity=window.velocity, times=times, data=s_data,
-            accel=window.accel))
+            accel=window.accel, idx=window.idx))
     return smoothed
 
 
@@ -357,6 +357,7 @@ class StepResponseTest:
     def _prepare_window_data(self, windows, dt_limit, signal_filter):
         np = self.numpy
         window_data = []
+        indices = []
         dt_max_global = 0.
         filter_window = signal_filter.filter_window
         skip_time = self.FILTER_SKIP_FRACTION_AT_FRONT * filter_window
@@ -378,7 +379,8 @@ class StepResponseTest:
             gamma = self.WEIGHT_ALPHA ** (1. / p) - 1.
             sqrt_w = (gamma / (1. + gamma * dt_fit / dt_max)) ** (-0.5 * p)
             window_data.append((dt_fit, data_fit, sqrt_w, data_range))
-        return window_data, dt_max_global
+            indices.append(window.idx)
+        return window_data, indices, dt_max_global
 
     def _solve_wls(self, window_data, C):
         # Solve A, B, D for model A + B*exp(-C*t) + D*t via WLS
@@ -454,16 +456,16 @@ class StepResponseTest:
         if mse > self.MAX_FIT_MSE_PHASE1:
             status = 'high_mse'
         return FitResult(tau=tau, status=status, mse=mse,
-                         n_evals=n_evals, n_fits=n_fits)
+                         n_evals=n_evals, n_fits=n_fits, solutions=None)
 
     def _fit_window_phase1(self, window, force_sign, signal_filter):
         dt = window.times - window.times[0]
         dt_limit = dt[-1] * self.PHASE1_FIT_FRACTION
-        window_data, dt_max = self._prepare_window_data(
+        window_data, _, dt_max = self._prepare_window_data(
                 [window], dt_limit, signal_filter)
         if not window_data:
             return FitResult(tau=None, status='too_few_after_skip',
-                             mse=None, n_evals=0, n_fits=0)
+                             mse=None, n_evals=0, n_fits=0, solutions=None)
         n_total = len(window_data[0][0])
         cost_func = self._make_cost(window_data)
         c_candidates = self._build_c_candidates(1. / dt_max, full=False)
@@ -471,30 +473,48 @@ class StepResponseTest:
         # Validate B decay factor sign: B should oppose force_sign and accel
         sol, _ = self._solve_wls(window_data[0], 1. / fit.tau)
         if force_sign * window.accel * sol[1] > 0:
-            return FitResult(tau=fit.tau, status='wrong_b_sign', mse=fit.mse,
-                             n_evals=fit.n_evals, n_fits=fit.n_fits)
-        return fit
+            status = 'wrong_b_sign'
+        else:
+            status = fit.status
+        return FitResult(tau=fit.tau, status=status, mse=fit.mse,
+                         n_evals=fit.n_evals, n_fits=fit.n_fits,
+                         solutions=[(window.idx, sol[0], sol[1],
+                                     1./fit.tau, sol[2])])
 
-    def _build_phase1_report(self, vel_fits, velocity_taus, overall_tau,
-                             n_evals, n_fits):
+    def _build_report(self, phase_label, vel_fits, velocity_taus,
+                      overall_tau, n_evals, n_fits):
+        row_fmt = ("  %-4d %-6s %-10s %-10s %-8s %-8s %-7s %-8s %-18s")
+        hdr_fmt = ("  %-4s %-6s %-10s %-10s %-8s %-8s %-7s %-8s %-18s")
         ok_count = sum(1 for _, f in vel_fits if f.status == 'ok')
         fail_count = len(vel_fits) - ok_count
         lines = []
-        lines.append("--- Phase 1 Fit Results (rough) ---")
-        lines.append("  %-4s %-6s %-8s %-8s %-8s" % (
-            'W#', 'v', 'tau', 'MSE', 'status'))
-        lines.append("  " + "-" * 40)
-        for idx, (vk, fit) in enumerate(vel_fits):
+        lines.append("--- %s Fit Results ---" % phase_label)
+        lines.append(hdr_fmt % (
+            'W#', 'v', 'A', 'B', 'C', 'D', 'tau', 'MSE', 'status'))
+        lines.append("  " + "-" * 76)
+        # Collect all rows (idx, vk, A, B, C, D, tau, MSE, status) then sort
+        rows = []
+        for vk, fit in vel_fits:
             tau_str = "%.4f" % fit.tau if fit.tau is not None else 'N/A'
             mse_str = "%.1e" % fit.mse if fit.mse is not None else 'N/A'
-            lines.append("  %-4d %-6.2f %-8s %-8s %-8s" % (
-                idx, vk, tau_str, mse_str, fit.status))
+            if fit.solutions:
+                for sol in fit.solutions:
+                    idx, A, B, C, D = sol
+                    rows.append((idx+1, "%.2f" % vk, "%.2f" % A,
+                                 "%.2f" % B, "%.2f" % C, "%.2f" % D,
+                                 tau_str, mse_str, fit.status))
+            else:
+                rows.append((-1, "%.2f" % vk, 'N/A', 'N/A',
+                             'N/A', 'N/A', tau_str, mse_str, fit.status))
+        rows.sort(key=lambda r: r[0])
+        for row in rows:
+            lines.append(row_fmt % row)
         lines.append("")
-        lines.append("  Phase 1 fits succeeded: %d  failed: %d  total: %d" % (
-            ok_count, fail_count, ok_count + fail_count))
+        lines.append("  %s fits succeeded: %d  failed: %d  total: %d" % (
+            phase_label, ok_count, fail_count, ok_count + fail_count))
         lines.append("")
         if velocity_taus:
-            lines.append("  Phase 1 tau by velocity:")
+            lines.append("  %s tau by velocity:" % phase_label)
             for v in sorted(velocity_taus.keys()):
                 lines.append(
                     "    v=%.2f  mean_tau=%.6f" % (v, velocity_taus[v]))
@@ -517,54 +537,31 @@ class StepResponseTest:
         velocity_taus, overall_tau = self._aggregate_taus(all_fits)
         n_evals = sum(fit.n_evals for _, fit in all_fits)
         n_fits = sum(fit.n_fits for _, fit in all_fits)
-        report_lines = self._build_phase1_report(
-                all_fits, velocity_taus, overall_tau, n_evals, n_fits)
+        report_lines = self._build_report(
+                'Phase 1 (rough)', all_fits, velocity_taus,
+                overall_tau, n_evals, n_fits)
         return all_fits, report_lines
 
     def _fit_velocity_phase2(self, windows, approx_tau, signal_filter):
         dt_limit = self.PHASE2_TAU_MULT * approx_tau
-        window_data, _ = self._prepare_window_data(
+        window_data, indices, _ = self._prepare_window_data(
                 windows, dt_limit, signal_filter)
         if not window_data:
             return FitResult(tau=None, status='no_valid_windows',
-                             mse=None, n_evals=0, n_fits=0)
+                             mse=None, n_evals=0, n_fits=0, solutions=None)
         n_total = sum(len(wd[0]) for wd in window_data)
         cost_func = self._make_cost(window_data)
         c_candidates = self._build_c_candidates(1. / approx_tau, full=True)
-        return self._run_fit(cost_func, n_total, c_candidates)
-
-    def _build_phase2_report(self, vel_fits, velocity_taus, overall_tau,
-                             n_evals, n_fits):
-        ok_count = sum(1 for _, f in vel_fits if f.status == 'ok')
-        fail_count = len(vel_fits) - ok_count
-        lines = []
-        lines.append("--- Fit Results ---")
-        lines.append("  %-4s %-6s %-8s %-8s %-8s" % (
-            'V#', 'v', 'tau', 'MSE', 'status'))
-        lines.append("  " + "-" * 40)
-        for idx, (vk, fit) in enumerate(vel_fits):
-            tau_str = "%.4f" % fit.tau if fit.tau is not None else 'N/A'
-            mse_str = "%.1e" % fit.mse if fit.mse is not None else 'N/A'
-            lines.append("  %-4d %-6.2f %-8s %-8s %-8s" % (
-                idx, vk, tau_str, mse_str, fit.status))
-        lines.append("")
-        lines.append("  Fits succeeded: %d  failed: %d  total: %d" % (
-            ok_count, fail_count, ok_count + fail_count))
-        lines.append("")
-        if velocity_taus:
-            lines.append("  Phase 2 tau by velocity:")
-            for v in sorted(velocity_taus.keys()):
-                lines.append(
-                        "    v=%.2f  tau=%.6f" % (v, velocity_taus[v]))
-            lines.append("")
-        if overall_tau is not None:
-            lines.append("  overall_tau=%.6f" % overall_tau)
-            lines.append("")
-        avg_evals = n_evals / n_fits if n_fits else 0
-        lines.append("  Optimization func evals: %d total, %.1f avg/call" % (
-            n_evals, avg_evals))
-        lines.append("")
-        return lines
+        fit = self._run_fit(cost_func, n_total, c_candidates)
+        # Compute per-window solutions at the optimal C
+        C_opt = 1. / fit.tau
+        solutions = []
+        for wd, idx in zip(window_data, indices):
+            sol, _ = self._solve_wls(wd, C_opt)
+            solutions.append((idx, sol[0], sol[1], C_opt, sol[2]))
+        return FitResult(tau=fit.tau, status=fit.status, mse=fit.mse,
+                         n_evals=fit.n_evals, n_fits=fit.n_fits,
+                         solutions=solutions)
 
     def _run_phase2(self, vel_groups, velocity_taus, signal_filter):
         phase2_fits = []
@@ -575,8 +572,9 @@ class StepResponseTest:
         p2_velocity_taus, p2_overall_tau = self._aggregate_taus(phase2_fits)
         n_evals = sum(fit.n_evals for _, fit in phase2_fits)
         n_fits = sum(fit.n_fits for _, fit in phase2_fits)
-        report_lines = self._build_phase2_report(
-                phase2_fits, p2_velocity_taus, p2_overall_tau, n_evals, n_fits)
+        report_lines = self._build_report(
+                'Phase 2', phase2_fits, p2_velocity_taus,
+                p2_overall_tau, n_evals, n_fits)
         return phase2_fits, report_lines
 
     def _aggregate_taus(self, vel_fits):
@@ -775,6 +773,18 @@ class SearchOvershootTest:
                          >= self.OVERSHOOT_VOTE_FRACTION)
         return has_overshoot, ratios, n_overshoot
 
+    def _format_ratios(self, ratios):
+        if not ratios:
+            return 'N/A'
+        sorted_ratios = sorted(ratios)
+        n_show = max(1, int(len(sorted_ratios) * self.OVERSHOOT_VOTE_FRACTION))
+        shown = sorted_ratios[:n_show]
+        parts = ['%.4f' % r for r in shown]
+        if n_show < len(sorted_ratios):
+            parts.append('..')
+            parts.append('%.4f' % sorted_ratios[-1])
+        return '[' + ','.join(parts) + ']'
+
     def test_pa(self, gcmd, extruder_test, data_collector,
                 extruder_status, signal_filter, pressure_advance, force_sign):
         gcmd.respond_info(
@@ -821,11 +831,9 @@ class SearchOvershootTest:
             if has_overshoot:
                 detected_overshoot = True
             logging.info(
-                    "PA=%.4f vel=%.2f overshoot=%d n_overshoot=%d"
-                    " ratios=[%.4f..%.4f]" % (pressure_advance, vk,
-                                              has_overshoot, n_overshoot,
-                                              min(ratios) if ratios else 0.,
-                                              max(ratios) if ratios else 0.))
+                    "PA=%.4f vel=%.2f overshoot=%d n_overshoot=%d ratios=%s" % (
+                        pressure_advance, vk, has_overshoot, n_overshoot,
+                        self._format_ratios(ratios)))
         self._test_count += 1
         gcmd.respond_info("Tested pressure_advance=%.4f -> %s" % (
             pressure_advance,
@@ -896,28 +904,27 @@ class SearchOvershootTest:
             for vr in res.vel_results:
                 rows.append((
                     idx + 1, res.pressure_advance, vr.velocity,
-                    min(vr.ratios) if vr.ratios else 0.,
-                    max(vr.ratios) if vr.ratios else 0.,
-                    vr.overshoot, vr.n_overshoot))
+                    vr.overshoot, vr.n_overshoot,
+                    self._format_ratios(vr.ratios)))
         rows.sort(key=lambda r: (r[1], r[2]))
         logging.info("--- PA Search Details ---")
-        logging.info("  %-4s %-10s %-8s %-12s %-8s",
-                      '#', 'PA', 'vel', 'ratios', 'overshoot')
-        logging.info("  " + "-" * 44)
+        logging.info("  %-4s %-10s %-8s %-10s %-42s",
+                      '#', 'PA', 'vel', 'overshoot', 'ratios')
+        logging.info("  " + "-" * 76)
         prev_pa = None
         marked_optimal = False
-        for tnum, pa, vk, min_r, max_r, is_overshoot, n_overshoot in rows:
+        for tnum, pa, vk, is_overshoot, n_overshoot, ratio_str in rows:
             if not marked_optimal and pa >= optimal_pa:
                 logging.info("  >> optimal PA ~ %.4f << " % optimal_pa)
                 marked_optimal = True
-            label = ('O (%d)' if is_overshoot else 'U (%d)') % n_overshoot
+            label = ('Y (v=%d)' if is_overshoot else 'N (v=%d)') % n_overshoot
             if pa != prev_pa:
-                logging.info("  %-4d %-10.4f %-8.2f %-12s %-8s" % (
-                    tnum, pa, vk, "[%.4f..%.4f]" % (min_r, max_r), label))
+                logging.info("  %-4d %-10.4f %-8.2f %-10s %-42s" % (
+                    tnum, pa, vk, label, ratio_str))
                 prev_pa = pa
             else:
-                logging.info("  %-4s %-10s %-8.2f %-12s %-8s" % (
-                    '', '', vk, "[%.4f..%.4f]" % (min_r, max_r), label))
+                logging.info("  %-4s %-10s %-8.2f %-10s %-42s" % (
+                    '', '', vk, label, ratio_str))
         logging.info(
                 "  Simulation-corrected PA: %.4f (raw: %.4f)" % (
                     corrected_pa, optimal_pa))
