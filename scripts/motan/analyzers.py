@@ -185,15 +185,15 @@ class GenSmoothed:
         data = [0.] * n
         hst = 0.5 * self.smooth_time
         seg_half_len = round(hst / seg_time)
-        inv_norm = 1. / sum([min(k + 1, seg_half_len + seg_half_len - k)
-                             for k in range(2 * seg_half_len)])
         for i in range(n):
             j = max(0, i - seg_half_len)
             je = min(n, i + seg_half_len)
-            avg_val = 0.
+            avg_val = norm = 0.
             for k, v in enumerate(src[j:je]):
-                avg_val += v * min(k + 1, seg_half_len + seg_half_len - k)
-            data[i] = avg_val * inv_norm
+                w = min(k + 1, seg_half_len + seg_half_len - k)
+                avg_val += v * w
+                norm += w
+            data[i] = avg_val / norm
         return data
 AHandlers["smooth"] = GenSmoothed
 
