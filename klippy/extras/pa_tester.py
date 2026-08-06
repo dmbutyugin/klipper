@@ -330,6 +330,7 @@ class StepResponseTest:
     tau to determine the fit window, for a refined per-velocity tau.
     """
 
+    FILTER_SKIP_FRACTION_AT_FRONT = 0.20  # skip this fraction of filter_window
     PHASE1_FIT_FRACTION = 0.8  # fraction of window to use for phase 1 fit
     PHASE2_TAU_MULT = 4.       # phase 2 fit window in units of phase 1 tau
     MAX_FIT_MSE_PHASE1 = 0.001 # max normalized MSE to mark a fit as 'ok'
@@ -353,17 +354,19 @@ class StepResponseTest:
             prior_accel = move.accel
         return cv_moves
 
-    def _prepare_window_data(self, windows, dt_limit):
+    def _prepare_window_data(self, windows, dt_limit, signal_filter):
         np = self.numpy
         window_data = []
         dt_max_global = 0.
+        filter_window = signal_filter.filter_window
+        skip_time = self.FILTER_SKIP_FRACTION_AT_FRONT * filter_window
         for window in windows:
             times = window.times
             data = window.data
             dt = times - times[0]
-            skip_mask = dt < dt_limit
-            dt_fit = dt[skip_mask]
-            data_fit = data[skip_mask]
+            keep_mask = (dt >= skip_time) & (dt < dt_limit)
+            dt_fit = dt[keep_mask] - skip_time
+            data_fit = data[keep_mask]
             if len(dt_fit) < 3:
                 continue
             data_range = np.max(data_fit) - np.min(data_fit)
@@ -453,10 +456,11 @@ class StepResponseTest:
         return FitResult(tau=tau, status=status, mse=mse,
                          n_evals=n_evals, n_fits=n_fits)
 
-    def _fit_window_phase1(self, window, force_sign):
+    def _fit_window_phase1(self, window, force_sign, signal_filter):
         dt = window.times - window.times[0]
         dt_limit = dt[-1] * self.PHASE1_FIT_FRACTION
-        window_data, dt_max = self._prepare_window_data([window], dt_limit)
+        window_data, dt_max = self._prepare_window_data(
+                [window], dt_limit, signal_filter)
         if not window_data:
             return FitResult(tau=None, status='too_few_after_skip',
                              mse=None, n_evals=0, n_fits=0)
@@ -504,11 +508,11 @@ class StepResponseTest:
         lines.append("")
         return lines
 
-    def _run_phase1(self, vel_groups, force_sign):
+    def _run_phase1(self, vel_groups, force_sign, signal_filter):
         all_fits = []
         for vk, group in vel_groups.items():
             for window in group:
-                fit = self._fit_window_phase1(window, force_sign)
+                fit = self._fit_window_phase1(window, force_sign, signal_filter)
                 all_fits.append((vk, fit))
         velocity_taus, overall_tau = self._aggregate_taus(all_fits)
         n_evals = sum(fit.n_evals for _, fit in all_fits)
@@ -517,9 +521,10 @@ class StepResponseTest:
                 all_fits, velocity_taus, overall_tau, n_evals, n_fits)
         return all_fits, report_lines
 
-    def _fit_velocity_phase2(self, windows, approx_tau):
+    def _fit_velocity_phase2(self, windows, approx_tau, signal_filter):
         dt_limit = self.PHASE2_TAU_MULT * approx_tau
-        window_data, _ = self._prepare_window_data(windows, dt_limit)
+        window_data, _ = self._prepare_window_data(
+                windows, dt_limit, signal_filter)
         if not window_data:
             return FitResult(tau=None, status='no_valid_windows',
                              mse=None, n_evals=0, n_fits=0)
@@ -561,10 +566,11 @@ class StepResponseTest:
         lines.append("")
         return lines
 
-    def _run_phase2(self, vel_groups, velocity_taus):
+    def _run_phase2(self, vel_groups, velocity_taus, signal_filter):
         phase2_fits = []
         for vk, group in vel_groups.items():
-            fit = self._fit_velocity_phase2(group, velocity_taus[vk])
+            fit = self._fit_velocity_phase2(
+                    group, velocity_taus[vk], signal_filter)
             phase2_fits.append((vk, fit))
         p2_velocity_taus, p2_overall_tau = self._aggregate_taus(phase2_fits)
         n_evals = sum(fit.n_evals for _, fit in phase2_fits)
@@ -655,7 +661,8 @@ class StepResponseTest:
         t0 = reactor.monotonic()
         # Phase 1: rough tau fit per window
         vel_fits, phase1_report_lines = _background_process_exec(
-                self.printer, self._run_phase1, (vel_groups, force_sign))
+                self.printer, self._run_phase1,
+                (vel_groups, force_sign, signal_filter))
         t1 = reactor.monotonic()
         for line in phase1_report_lines:
             logging.info(line)
@@ -669,7 +676,7 @@ class StepResponseTest:
         # Phase 2: refined joint fit per velocity group
         p2_fits, phase2_report_lines = _background_process_exec(
                 self.printer, self._run_phase2,
-                (vel_groups, velocity_taus))
+                (vel_groups, velocity_taus, signal_filter))
         t2 = reactor.monotonic()
         for line in phase2_report_lines:
             logging.info(line)
