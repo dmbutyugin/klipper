@@ -720,22 +720,87 @@ class StepResponseTest:
                     self.last_measured_pressure_advance}
 
 
+class PAPosterior:
+    # Tracks P(pa | test outcomes) Bayesian posterior over an adaptive PA grid
+    # for a log-logistic overshoot-likelihood model
+
+    GRID_ABS_INC = 0.0005         # min posterior grid step (absolute)
+    GRID_REL_INC = 0.005          # min posterior grid step (fraction of PA)
+    LIKELIHOOD_BETA = 20.         # log-logistic shape parameter (steepness)
+    LIKELIHOOD_POWER = 0.5        # likelihood tempering exponent (<1 robust)
+    LIKELIHOOD_FLOOR = 0.05       # irreducible misclassification probability
+
+    def __init__(self, numpy, pa_min, pa_max):
+        self.numpy = np = numpy
+        self.pa_grid = self._gen_pa_grid(pa_min, pa_max)
+        n = len(self.pa_grid)
+        self.posterior = np.ones(n, dtype=np.float64) / n
+
+    def _gen_pa_grid(self, pa_min, pa_max):
+        # Generate adaptive grid
+        current = max(pa_min, self.GRID_ABS_INC)
+        points = []
+        while current < pa_max:
+            points.append(current)
+            current += max(self.GRID_ABS_INC, current * self.GRID_REL_INC)
+        return self.numpy.array(points)
+
+    def _p_overshoot(self, pa):
+        # Compute probability of measuring overshoot at a given pa value
+        # for the true pa values from pa_grid using log-logistic CDF
+        span = 1. - 2. * self.LIKELIHOOD_FLOOR
+        ratio = (pa / self.pa_grid) ** self.LIKELIHOOD_BETA
+        return self.LIKELIHOOD_FLOOR + span * ratio / (1. + ratio)
+
+    def update(self, pa, overshoot):
+        likelihood = self._p_overshoot(pa)
+        if not overshoot:
+            likelihood = 1. - likelihood
+        self.posterior *= likelihood ** self.LIKELIHOOD_POWER
+        self.posterior /= self.numpy.sum(self.posterior)
+
+    def _cdf(self):
+        cdf = self.posterior.cumsum()
+        return cdf / cdf[-1]
+
+    def median(self):
+        np = self.numpy
+        cdf = self._cdf()
+        return self.pa_grid[np.argmin(np.abs(cdf - 0.5))]
+
+    def ci(self, level):
+        np = self.numpy
+        cdf = self._cdf()
+        n = len(self.pa_grid)
+        half = (1. - level) / 2.
+        ci_low = self.pa_grid[max(0, np.searchsorted(cdf, half) - 1)]
+        ci_high = self.pa_grid[min(n - 1, np.searchsorted(cdf, 1. - half) + 1)]
+        return ci_low, ci_high
+
+
 class SearchOvershootTest:
-    """Find optimal PA via binary-like search for the overshoot threshold."""
+    """Find optimal PA via Bayesian binary search for the overshoot threshold.
+
+    An initial phase probes increasing PA values to find where overshoot
+    begins (each outcome updating the posterior), then a refinement phase
+    tests at the posterior median until the 95% CI is narrow enough.
+    """
 
     STEADY_STATE_TAIL = 0.2          # fraction of tail for steady-state mean
     OVERSHOOT_THRESHOLD = 0.99       # integral threshold value for an overshoot
     OVERSHOOT_VOTE_FRACTION = 0.4    # fraction of windows to declare overshoot
     FORCE_SMOOTH_TIME_SETTLE = 2.0   # extra window around flow change to test
     ZERO_VEL_THRESHOLD = 0.1         # min velocity to keep an accel move
-    PA_SEARCH_START = 0.05           # starting PA for exponential bracketing
+    PA_SEARCH_START = 0.05           # starting PA for overshoot search
     PA_SEARCH_MAX = 2.0              # hard upper limit for PA search
-    PA_SEARCH_MIN_INTERVAL = 0.002   # absolute convergence tolerance
-    PA_SEARCH_REL_TOL = 0.01         # relative convergence tolerance
-    PA_SEARCH_SHRINK_FACTOR = 0.33   # fraction of interval shifted each step
+    PA_SEARCH_MAX_STEP = 0.2         # max PA increase per discovery step
+    PA_CI_ABS_TOL = 0.02             # stop: max 95% CI width (absolute)
+    PA_CI_REL_TOL = 0.30             # stop: max 95% CI width (fraction of est.)
+    PA_MAX_TESTS = 30                # refinement test safety limit
     PA_RANGE_WARNING_FRACTION = 0.10 # PA proximity to boundary for warning
     PA_WARNING_HIGH_MARGIN = 0.2     # warn if PA within this of PA_SEARCH_MAX
     PA_CORRECTED_REL_START = 0.5     # relative corrected PA search start
+    PA_CORRECTED_ABS_TOL = 0.002     # absolute corrected PA search tolerance
     PA_CORRECTED_REL_TOL = 0.001     # relative corrected PA search tolerance
     SIMULATION_SEG_TIME = 0.0001     # simulation time step (s)
     CORRECTION_MIN_FRACTION = 0.05   # min PA correction fraction to report
@@ -869,41 +934,38 @@ class SearchOvershootTest:
             overshoot=detected_overshoot,
             vel_results=vel_results)
 
-    def _bracket_pa(self, test_cb):
+    def _find_overshoot(self, test_cb, posterior):
+        # Increase PA until overshoot is confirmed twice
         pa = self.PA_SEARCH_START
-        left = 0.
-        res = test_cb(pa)
-        overshoot = res.overshoot
-        # Exponentially increase PA limit until overshoot is confirmed twice
+        prev_overshoot = False
         while pa <= self.PA_SEARCH_MAX:
-            res = test_cb(2. * pa)
-            if res.overshoot:
-                if overshoot:
-                    return left, 1.5 * pa
-                overshoot = True
-            else:
-                overshoot = False
-                left = pa
-            pa *= 2.
+            res = test_cb(pa)
+            posterior.update(pa, res.overshoot)
+            if res.overshoot and prev_overshoot:
+                return
+            prev_overshoot = res.overshoot
+            pa = min(pa * 2., pa + self.PA_SEARCH_MAX_STEP)
         raise self.printer.command_error(
             "No overshoot detected up to pressure_advance=%.2f. "
             "Check sensor or try a higher flow rate."
             % self.PA_SEARCH_MAX)
 
-    def _contracting_search(self, test_cb, left, right):
-        while True:
-            m = 0.5 * (left + right)
-            width = right - left
-            tol = max(self.PA_SEARCH_MIN_INTERVAL, self.PA_SEARCH_REL_TOL * m)
-            if width <= tol:
+    def _bayesian_search(self, test_cb, posterior):
+        # Test at the posterior median (maximum information gain)
+        # until the 95% CI is narrower than the adaptive tolerance
+        pa_estimate = posterior.median()
+        while self._test_count < self.PA_MAX_TESTS:
+            res = test_cb(pa_estimate)
+            posterior.update(pa_estimate, res.overshoot)
+            pa_estimate = posterior.median()
+            ci_lo, ci_hi = posterior.ci(0.95)
+            tol = max(self.PA_CI_ABS_TOL, self.PA_CI_REL_TOL * pa_estimate)
+            logging.info(
+                    "Posterior: pa_estimate=%.4f 95%% CI=[%.4f, %.4f] tol=%.4f"
+                    % (pa_estimate, ci_lo, ci_hi, tol))
+            if ci_hi - ci_lo < tol:
                 break
-            adjust = width * self.PA_SEARCH_SHRINK_FACTOR
-            res = test_cb(m)
-            if res.overshoot:
-                right -= adjust
-            else:
-                left += adjust
-        return m
+        return posterior
 
     def _search_optimal_pa(self, gcmd, extruder_test, data_collector,
                            extruder_status, signal_filter, force_sign,
@@ -915,16 +977,19 @@ class SearchOvershootTest:
                 extruder_status, signal_filter, pa, force_sign)
             results.append(res)
             return res
-        # First detect the PA range (if not provided), then run a binary-like
-        # search to determine an optimal PA value without overshoot
+        # A user-supplied PA_RANGE acts as the prior support; otherwise
+        # find the overshoot region first and refine it via the posterior
         if pa_range is not None:
-            left, right = pa_range
+            pa_min, pa_max = pa_range
         else:
-            left, right = self._bracket_pa(test_cb)
-        optimal_pa = self._contracting_search(test_cb, left, right)
-        return optimal_pa, results
+            pa_min, pa_max = 0., self.PA_SEARCH_MAX
+        posterior = PAPosterior(self.numpy, pa_min, pa_max)
+        if pa_range is None:
+            self._find_overshoot(test_cb, posterior)
+        self._bayesian_search(test_cb, posterior)
+        return posterior, results
 
-    def _log_search_stats(self, results, optimal_pa, corrected_pa, area):
+    def _log_search_stats(self, results, optimal_pa, corrected_pa, area, ci90):
         rows = []
         for idx, res in enumerate(results):
             for vr in res.vel_results:
@@ -951,6 +1016,9 @@ class SearchOvershootTest:
             else:
                 logging.info("  %-4s %-10s %-8.2f %-10s %-42s" % (
                     '', '', vk, label, ratio_str))
+        ci_lo, ci_hi = ci90
+        logging.info("  90%% CI: [%.4f, %.4f] (width %.4f)" % (ci_lo, ci_hi,
+                                                               ci_hi - ci_lo))
         logging.info(
                 "  Simulation-corrected PA: %.4f (raw: %.4f)" % (
                     corrected_pa, optimal_pa))
@@ -1041,8 +1109,7 @@ class SearchOvershootTest:
             return detected_pa
         while True:
             m = 0.5 * (left + right)
-            tol = max(self.PA_SEARCH_MIN_INTERVAL,
-                      self.PA_CORRECTED_REL_TOL * m)
+            tol = max(self.PA_CORRECTED_ABS_TOL, self.PA_CORRECTED_REL_TOL * m)
             if right - left <= tol:
                 return m
             if sim_test_cb(m):
@@ -1141,7 +1208,7 @@ class SearchOvershootTest:
                         gcmd, extruder_test, data_collector, filament_diameter)
                 gcmd.respond_info("Detected extrude_force_sign=%d" % force_sign)
             gcmd.respond_info("Searching for optimal pressure_advance...")
-            optimal_pa, results = self._search_optimal_pa(
+            posterior, results = self._search_optimal_pa(
                 gcmd, extruder_test, data_collector,
                 extruder_status, signal_filter, force_sign, pa_range)
         finally:
@@ -1150,13 +1217,17 @@ class SearchOvershootTest:
         self.gcode.run_script_from_command("SET_PRESSURE_ADVANCE ADVANCE=%.6f" %
                                            extruder_status['pressure_advance'])
 
+        # Use the posterior median as the point estimate: it is unbiased
+        # under the multiplicative likelihood model, unlike the mean
+        optimal_pa = posterior.median()
+        ci90 = posterior.ci(0.90)
         self.last_measured_pressure_advance = float(optimal_pa)
         slow_velocity = extruder_test.get_slow_velocity(gcmd, filament_diameter)
         fast_velocity = extruder_test.get_fast_velocity(gcmd, filament_diameter)
         corrected_pa = self._find_corrected_pa(
                 optimal_pa, smooth_time, signal_filter,
                 slow_velocity, fast_velocity, accel_limit)
-        self._log_search_stats(results, optimal_pa, corrected_pa, area)
+        self._log_search_stats(results, optimal_pa, corrected_pa, area, ci90)
         if (abs(corrected_pa - optimal_pa) <
             self.CORRECTION_MIN_FRACTION * optimal_pa):
             corrected_pa = None
