@@ -141,10 +141,11 @@ class PACalibrationDataCollector:
         self.loadcell = loadcell
         self.force_samples = []
         self.trapq_moves = []
-        self._collecting = False
+        self._collecting = self._stopped = False
 
     def _on_loadcell_data(self, msg):
         if not self._collecting:
+            self._stopped = True
             return False
         data = msg.get('data')
         if data is not None:
@@ -176,16 +177,19 @@ class PACalibrationDataCollector:
         toolhead = self.printer.lookup_object('toolhead')
         reactor = self.printer.get_reactor()
         start_time = toolhead.get_last_move_time()
+        self.force_samples = []
+        self._stopped = False
         self._collecting = True
         self.loadcell.add_client(self._on_loadcell_data)
         run_test_cb()
         end_time = toolhead.get_last_move_time()
         timeout = reactor.monotonic() + 2.
-        while not self.force_samples or self.force_samples[-1][0] < end_time:
+        while not self._stopped:
             if reactor.monotonic() > timeout:
                 break
+            if self.force_samples and self.force_samples[-1][0] >= end_time:
+                self._collecting = False
             reactor.pause(reactor.monotonic() + 0.05)
-        self._collecting = False
         self.trapq_moves = self._collect_trapq(start_time, end_time)
         return self.force_samples, self.trapq_moves
 
