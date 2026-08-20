@@ -45,6 +45,7 @@ class IntParam:
                 gcmd.get_int(self.name, self.config_value,
                              minval=self._minval, maxval=self._maxval)
 
+
 class FloatParam:
     def __init__(self, config, name, default=None, minval=None, maxval=None,
                  above=None, below=None):
@@ -66,6 +67,7 @@ class FloatParam:
                 gcmd.get_float(self.name, self.config_value,
                                minval=self._minval, maxval=self._maxval,
                                above=self._above, below=self._below)
+
 
 class PACalibrationExtruderTest:
     def __init__(self, config):
@@ -133,6 +135,8 @@ class PACalibrationExtruderTest:
             E += dist
             toolhead.move([X, Y, Z, E], velocity)
         toolhead.wait_moves()
+        toolhead.set_position(tpos)
+
 
 class PACalibrationDataCollector:
     def __init__(self, printer, extruder, loadcell):
