@@ -240,7 +240,7 @@ class GCodeMove:
         extrude_factor = self.extrude_factor
         e_value = (last_e_pos - self.base_position[ea_index]) / extrude_factor
         self.base_position[ea_index] = last_e_pos - e_value * new_extrude_factor
-        self.extrude_factors[gcode_id] = new_extrude_factor
+        self.extrude_factor = new_extrude_factor
     cmd_SET_GCODE_OFFSET_help = "Set a virtual offset to g-code positions"
     def cmd_SET_GCODE_OFFSET(self, gcmd):
         move_delta = [0.] * len(self.axis_map)
